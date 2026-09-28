@@ -1,0 +1,145 @@
+# B2Z1 WBC real-robot deploy configuration
+
+network:
+  interface: enp8s0
+  sport_topic: rt/lf/sportmodestate
+  sport_topic_fallback: rt/sportmodestate
+
+control:
+  rate_hz: 50
+  lowcmd_rate_hz: 500
+  kp: 200.0
+  kd: 10.0
+  # High gains for the initial hold after sport release (see b2_stand_example: Kp=1000).
+  startup_kp: 1000.0
+  startup_kd: 10.0
+  # Legs only (policy outputs 12); arm pose via IK on the robot.
+  action_scale: [0.4, 0.45, 0.45, 0.4, 0.45, 0.45, 0.4, 0.45, 0.45, 0.4, 0.45, 0.45]
+  z1_command_freq_hz: 100
+
+observation:
+  history_len: 10
+  num_proprio: 85
+  num_priv: 18
+  # Match b2z1_lambdawbc_config normalization.obs_scales (not teleop_task raw values).
+  lin_vel_scale: 1.0
+  ang_vel_scale: 1.0
+  dof_vel_scale: 0.05
+  foot_contact_threshold: 440.0
+
+robot:
+  # Arm mount from URDF fixed joint base_static_joint (overrides any hardcoded offset).
+  urdf: urdf/b2z1.urdf
+  # Filled at load time from urdf (currently xyz="0.15 0 0.10").
+  # policy_arm_base_offset / z1_base_in_robot_base are set in load_config().
+  gravity_vec: [0.0, 0.0, -1.0]
+  default_joint_angles:
+    FL_hip_joint: 0.0
+    FL_thigh_joint: 0.8
+    FL_calf_joint: -1.5
+    FR_hip_joint: 0.0
+    FR_thigh_joint: 0.8
+    FR_calf_joint: -1.5
+    RL_hip_joint: 0.0
+    RL_thigh_joint: 0.8
+    RL_calf_joint: -1.5
+    RR_hip_joint: 0.0
+    RR_thigh_joint: 0.8
+    RR_calf_joint: -1.5
+    # z1 waist..wrist_rotate filled from arm_init_joint in load_config().
+    z1_jointGripper: -0.785
+
+vr:
+  host: 127.0.0.1
+  port: 8765
+
+gait:
+  frequencies: 2.0
+  phases: 0.5
+  offsets: 0.0
+  bounds: 0.0
+  durations: 0.5
+
+# Base velocity / dvel gait thresholds (same clips for use_cmd true or false).
+# Gait advances only if |vx|>lin_vel_x_clip or |vy|>lin_vel_y_clip or |yaw|>ang_vel_yaw_clip.
+commands:
+  use_cmd: false
+  cmd_vx: 0.0
+  cmd_vy: 0.0
+  cmd_yaw: 0.0
+  lin_vel_x_clip: 0.1
+  lin_vel_y_clip: 0.1
+  ang_vel_yaw_clip: 0.2
+
+# WBC policy checkpoint (.pt). Optional if passed via --checkpoint on the CLI.
+policy:
+  # checkpoint: /home/jimmyyang/unitree_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy/model_50000.pt
+  checkpoint: /home/jimmyyang/unitree_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy/model_100000.pt
+  # checkpoint: null
+
+
+# Keyboard teleop magnitudes when --vel_keyboard is set (m/s, rad/s).
+keyboard_vel:
+  vx_fwd: 0.4    # w
+  vx_back: -0.4  # s
+  vy_left: 0.3   # a
+  vy_right: -0.3 # d
+  yaw_left: 0.3  # q
+  yaw_right: -0.3 # e
+
+init_deploy_joint:
+  # Sim/URDF order: hip, thigh, calf (rad). Used before policy takes over.
+  # FL: [0.0, 1.0, -1.4]
+  # FR: [0.0, 1.0, -1.4]
+  # RL: [-0.2, 1.2, -1.8]
+  # RR: [-0.05, 1.0, -1.8]
+  # FL: [-0.2,  0.1, -1.8]
+  # FR: [0.2,  0.3, -2.0]
+  # RL: [0.04,  0.5, -1.46]
+  # RR: [-0.18,  0.4, -1.4]
+  # FL: [ 0.2,  0.7, -1.2]
+  # FR: [-0.2,  0.8, -1.2]
+  # RL: [-0.05,  0.9, -1.6]
+  # RR: [-0.1,  0.8, -1.6]
+
+  FL: [0.15,  0.4, -1.4]
+  FR: [-0.12,  0.7, -1.4]
+  RL: [0.17,  0.6, -1.6]
+  RR: [0.1,  0.9, -1.8]
+
+  # FL: [ 0.12,  0.67, -1.3]
+  # FR: [-0.11,  0.71, -1.3]
+  # RL: [ 0.01,  0.77, -1.6]
+  # RR: [-0.12,  0.78, -1.6]
+
+init_deploy_ramp_s: 5.0
+init_deploy_hold_s: 5.0
+
+# Soft-land target on Ctrl+C / stop while lowcmd is active (sim order, rad).
+# Captured from a physical lay-down pose; interp uses policy Kp/Kd.
+shutdown_joint:
+  FL: [0.3079, 1.2067, -2.7810]
+  FR: [-0.2967, 1.2141, -2.7756]
+  RL: [0.3000, 1.2099, -2.7816]
+  RR: [-0.3047, 1.2119, -2.7796]
+shutdown_ramp_s: 3.0
+shutdown_hold_s: 0.5
+shutdown_kp: 500.0
+# shutdown_kd defaults to control.kd if omitted.
+
+# Single source for Z1 pre-VR / home pose (6 joints, rad):
+# waist, shoulder, elbow, wrist_angle, forearm_roll, wrist_rotate.
+# Propagated by load_config() to:
+#   - arm_home_joint (deploy hold / phase_variable > 0.5)
+#   - robot.default_joint_angles z1_* (obs defaults)
+#   - TELEOP_INIT / VR robot prep (z1_robot_prep)
+# Was previously [0, 2*pi/3, -2*pi/3, 0, 0, pi/2].
+# arm_init_joint: [0.0, 0.6, -0.6, 0.0, 0.0, 1.5707963267948966]
+# arm_init_joint: [0.0, 0.6, -0.6, 0.0, 0.0, 0.0]
+arm_init_joint: [0.0, 1.8, -1.8, 0.0, 0.0, 0.0]
+# Soft joint limits applied to Z1 commands in deploy (rad). Elbow = joint index 2.
+# SDK elbow range is ~[-2.89, 0]; we tighten lower bound for safety/workspace.
+arm_joint_limits:
+  elbow: [-2.0, 0.0]
+# Seconds to linearly interpolate joints toward arm_home when phase_variable > 0.5.
+arm_home_interp_s: 2.0

@@ -1,0 +1,23 @@
+left_tracker_serial: "LHR-FC53C9BB"
+right_tracker_serial: "LHR-12D38AEC"
+freq: 50.0
+translational_gain: 2.0
+quat: true
+websocket_host: "0.0.0.0"
+websocket_port: 8765
+frame_cali_wait_time: 2.0
+
+# Hardware axis fix in vr_tracker_core (radians, about tracker z after R_t).
+tracker_z_rotation: -1.5707963267948966
+
+# Duration (s) to ramp to teleop init joints before VR connects.
+teleop_prep_move_duration: 3.0
+# Timeout (s) waiting for z1_ctrl UDP connection during prep.
+teleop_prep_connect_timeout: 10.0
+#   +x forward, +y up, +z lateral
+# Rotation: body rotvec components are remapped, then composed as
+#   roll about x, pitch about z, yaw about y.
+vr_body_to_ee_matrix:
+  - [-1.0, 0.0, 0.0]
+  - [0.0, 0.0, -1.0]
+  - [0.0, -1.0, 0.0]
