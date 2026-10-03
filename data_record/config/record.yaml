@@ -1,0 +1,22 @@
+# Data recording laptop configuration
+
+network:
+  interface: enp8s0
+  sport_topic: rt/lf/sportmodestate
+
+record:
+  rate_hz: 20.0
+  out_dir: recordings
+  # Max age (s) before EE goal is treated as missing (written as NaN).
+  ee_goal_stale_s: 0.5
+
+ee_goal_ws:
+  host: 127.0.0.1
+  port: 8770
+
+camera:
+  # Leave serial null to use the first connected RealSense.
+  serial: null
+  width: 640
+  height: 480
+  fps: 30

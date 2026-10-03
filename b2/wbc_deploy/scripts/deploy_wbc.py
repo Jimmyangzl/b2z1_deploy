@@ -27,10 +27,20 @@ from unitree_sdk2py.utils.thread import RecurrentThread
 
 from state.leg_dof_mapping import motor_legs_to_sim, sim_legs_to_motor
 from commands.vel_keyboard import VelKeyboardController
+from control.gains import GainLike, as_gain_vector
 from control.incremental_ik import incremental_ik_step
 from safety.leg_shutdown import leg_joint_dict_to_array, run_leg_soft_shutdown
 from utils.math_utils import pos_quat_to_homogeneous
 from wbc_runtime import build_arg_parser, load_runtime, print_obs_summary, run_policy
+
+
+def _maybe_publish_ee(publisher, obs_pack: dict) -> None:
+    if publisher is None:
+        return
+    goal = obs_pack.get("ee_goal_local_cart")
+    if goal is None:
+        return
+    publisher.update(goal)
 
 
 def _print_command_mode(config: dict) -> None:
@@ -60,9 +70,15 @@ def init_deploy_joint_from_config(config: dict) -> np.ndarray:
 class B2LowCmdWriter:
     """500 Hz rt/lowcmd publisher for leg position targets."""
 
-    def __init__(self, kp: float, kd: float, initial_targets_sim: Optional[np.ndarray] = None):
-        self.kp = kp
-        self.kd = kd
+    def __init__(
+        self,
+        kp: GainLike,
+        kd: GainLike,
+        initial_targets_sim: Optional[np.ndarray] = None,
+    ):
+        # Store gains in B2 motor order (same indexing as motor_cmd[0:12]).
+        self.kp = sim_legs_to_motor(as_gain_vector(kp, 12, "leg kp"))
+        self.kd = sim_legs_to_motor(as_gain_vector(kd, 12, "leg kd"))
         self.crc = CRC()
         self.low_cmd = unitree_go_msg_dds__LowCmd_()
         if initial_targets_sim is not None:
@@ -95,9 +111,11 @@ class B2LowCmdWriter:
             self.low_cmd.motor_cmd[i].kd = 0
             self.low_cmd.motor_cmd[i].tau = 0
 
-    def set_gains(self, kp: float, kd: float) -> None:
-        self.kp = kp
-        self.kd = kd
+    def set_gains(self, kp: GainLike, kd: GainLike) -> None:
+        """Set leg gains; scalar or length-12 list in sim (FL/FR/RL/RR) order."""
+        with self._lock:
+            self.kp = sim_legs_to_motor(as_gain_vector(kp, 12, "leg kp"))
+            self.kd = sim_legs_to_motor(as_gain_vector(kd, 12, "leg kd"))
 
     def set_leg_targets(self, q_targets_sim: np.ndarray) -> None:
         """Accept leg targets in URDF/sim order; store in B2 motor order for lowcmd."""
@@ -112,11 +130,13 @@ class B2LowCmdWriter:
     def _write(self) -> None:
         with self._lock:
             targets = self._targets.copy()
+            kp = self.kp.copy()
+            kd = self.kd.copy()
         for i in range(12):
             self.low_cmd.motor_cmd[i].q = float(targets[i])
             self.low_cmd.motor_cmd[i].dq = 0.0
-            self.low_cmd.motor_cmd[i].kp = self.kp
-            self.low_cmd.motor_cmd[i].kd = self.kd
+            self.low_cmd.motor_cmd[i].kp = float(kp[i])
+            self.low_cmd.motor_cmd[i].kd = float(kd[i])
             self.low_cmd.motor_cmd[i].tau = 0.0
         self.low_cmd.crc = self.crc.Crc(self.low_cmd)
         self.publisher.Write(self.low_cmd)
@@ -138,14 +158,28 @@ class Z1ArmWriter:
         home_interp_s: float = 2.0,
         control_mode: str = "tdes",
         elbow_limit: Optional[tuple] = None,
+        fsm_mode: str = "jointctrl",
+        kp: GainLike = 20.0,
+        kd: GainLike = 2000.0,
+        gripper_kp: float = 20.0,
+        gripper_kd: float = 2000.0,
     ):
         if control_mode not in ("wbc", "tdes"):
             raise ValueError(f"control_mode must be 'wbc' or 'tdes', got {control_mode!r}")
+        fsm_mode = str(fsm_mode).lower().strip()
+        if fsm_mode not in ("jointctrl", "lowcmd"):
+            raise ValueError(f"fsm_mode must be 'jointctrl' or 'lowcmd', got {fsm_mode!r}")
         self.arm_home_joint = np.asarray(arm_home_joint, dtype=np.float64).reshape(6)
         self.arm_mount_in_base = np.asarray(arm_mount_in_base, dtype=np.float64).reshape(3)
         self.control_dt = float(control_dt)
         self.home_interp_s = max(1e-3, float(home_interp_s))
         self.control_mode = control_mode
+        self.fsm_mode = fsm_mode
+        # Per-joint Z1 gains (Unitree command units). Applied only in LOWCMD.
+        self.kp = as_gain_vector(kp, 6, "arm kp")
+        self.kd = as_gain_vector(kd, 6, "arm kd")
+        self.gripper_kp = float(gripper_kp)
+        self.gripper_kd = float(gripper_kd)
         if elbow_limit is None:
             self._elbow_limit = (-2.0, 0.0)
         else:
@@ -173,6 +207,7 @@ class Z1ArmWriter:
             "has_ik": None,
             "tdes_trans_norm": 0.0,
             "mode": "idle",
+            "fsm": fsm_mode,
         }
 
     def _apply_joint_limits(self, q: np.ndarray) -> np.ndarray:
@@ -180,6 +215,29 @@ class Z1ArmWriter:
         q = np.asarray(q, dtype=np.float64).reshape(6).copy()
         q[2] = float(np.clip(q[2], self._elbow_limit[0], self._elbow_limit[1]))
         return q
+
+    def set_gains(
+        self,
+        kp: GainLike,
+        kd: GainLike,
+        gripper_kp: Optional[float] = None,
+        gripper_kd: Optional[float] = None,
+    ) -> None:
+        """Update arm PD gains (applied immediately if already in LOWCMD)."""
+        self.kp = as_gain_vector(kp, 6, "arm kp")
+        self.kd = as_gain_vector(kd, 6, "arm kd")
+        if gripper_kp is not None:
+            self.gripper_kp = float(gripper_kp)
+        if gripper_kd is not None:
+            self.gripper_kd = float(gripper_kd)
+        if self._ready and self.fsm_mode == "lowcmd" and self._arm is not None:
+            self._apply_arm_gains()
+
+    def _apply_arm_gains(self) -> None:
+        lowcmd = self._arm._ctrlComp.lowcmd
+        lowcmd.setControlGain(self.kp.tolist(), self.kd.tolist())
+        if hasattr(lowcmd, "setGripperGain"):
+            lowcmd.setGripperGain(self.gripper_kp, self.gripper_kd)
 
     def _ensure_ready(self) -> bool:
         if self._ready:
@@ -191,7 +249,28 @@ class Z1ArmWriter:
         self._arm_state = unitree_arm_interface.ArmFSMState
         # loopOn() is started by Z1StateReader after VR prep release.
         self._arm.setWait(False)
-        self._arm.startTrack(self._arm_state.JOINTCTRL)
+        if self.fsm_mode == "lowcmd":
+            # Unitree requires PASSIVE → LOWCMD; gains / tau apply only in LOWCMD.
+            if hasattr(self._arm, "setFsmLowcmd"):
+                self._arm.setFsmLowcmd()
+            else:
+                self._arm.setFsm(self._arm_state.PASSIVE)
+                self._arm.setFsm(self._arm_state.LOWCMD)
+            self._apply_arm_gains()
+            print(
+                "[Z1ArmWriter] LOWCMD gains kp="
+                f"{np.array2string(self.kp, precision=1)} "
+                f"kd={np.array2string(self.kd, precision=1)} "
+                f"gripper=({self.gripper_kp:.1f},{self.gripper_kd:.1f})",
+                flush=True,
+            )
+        else:
+            self._arm.startTrack(self._arm_state.JOINTCTRL)
+            print(
+                "[Z1ArmWriter] JOINTCTRL (arm kp/kd from yaml ignored; "
+                "set arm_control.mode: lowcmd to use custom gains).",
+                flush=True,
+            )
         self._ready = True
         return True
 
@@ -205,7 +284,8 @@ class Z1ArmWriter:
         has_ik = s.get("has_ik")
         ik_s = "?" if has_ik is None else str(bool(has_ik))
         return (
-            f"vr_connected={s.get('vr_connected')} holding={s.get('holding')} "
+            f"fsm={self.fsm_mode} vr_connected={s.get('vr_connected')} "
+            f"holding={s.get('holding')} "
             f"Tdes0={s.get('Tdes0_locked')} |Tdes|={s.get('tdes_trans_norm'):.3f} "
             f"hasIK={ik_s} mode={s.get('mode')}"
         )
@@ -391,6 +471,7 @@ def run_init_deploy_sequence(
     rate: float,
     dt: float,
     shutdown: dict,
+    ee_goal_publisher=None,
 ) -> bool:
     """Ramp to init_deploy_joint, hold while printing obs, then confirm policy.
 
@@ -419,6 +500,7 @@ def run_init_deploy_sequence(
         robot = aggregator.read()
         if robot.valid:
             obs_pack = obs_builder.build(robot, vr_goal)
+            _maybe_publish_ee(ee_goal_publisher, obs_pack)
             action = run_policy(policy, obs_pack["obs_vector"])
             obs_builder.update_action_history(action)
             if z1_writer is not None:
@@ -449,6 +531,7 @@ def run_init_deploy_sequence(
         robot = aggregator.read()
         if robot.valid:
             obs_pack = obs_builder.build(robot, vr_goal)
+            _maybe_publish_ee(ee_goal_publisher, obs_pack)
             action = run_policy(policy, obs_pack["obs_vector"])
             obs_builder.update_action_history(action)
             if z1_writer is not None:
@@ -494,9 +577,24 @@ def run_init_deploy_sequence(
     return True
 
 
+def _format_gains(label: str, kp: GainLike, kd: GainLike, n: int) -> str:
+    kp_v = as_gain_vector(kp, n, label + " kp")
+    kd_v = as_gain_vector(kd, n, label + " kd")
+    if np.allclose(kp_v, kp_v[0]) and np.allclose(kd_v, kd_v[0]):
+        return f"{label} Kp={kp_v[0]:.1f} Kd={kd_v[0]:.1f}"
+    return (
+        f"{label} Kp={np.array2string(kp_v, precision=1)} "
+        f"Kd={np.array2string(kd_v, precision=1)}"
+    )
+
+
 def _make_z1_writer(args, aggregator, config, arm_home, dt, *, control_mode: str) -> Z1ArmWriter:
     limits = config.get("arm_joint_limits") or {}
     elbow = limits.get("elbow", [-2.0, 0.0])
+    arm_cfg = config.get("arm_control") or {}
+    # SDK LOWCMD defaults (Unitree command units).
+    default_arm_kp = [20.0, 30.0, 30.0, 20.0, 15.0, 10.0]
+    default_arm_kd = [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
     return Z1ArmWriter(
         aggregator.z1,
         arm_home,
@@ -511,6 +609,11 @@ def _make_z1_writer(args, aggregator, config, arm_home, dt, *, control_mode: str
         home_interp_s=float(config.get("arm_home_interp_s", 2.0)),
         control_mode=control_mode,
         elbow_limit=(float(elbow[0]), float(elbow[1])),
+        fsm_mode=str(arm_cfg.get("mode", "jointctrl")),
+        kp=arm_cfg.get("kp", default_arm_kp),
+        kd=arm_cfg.get("kd", default_arm_kd),
+        gripper_kp=float(arm_cfg.get("gripper_kp", 20.0)),
+        gripper_kd=float(arm_cfg.get("gripper_kd", 2000.0)),
     )
 
 
@@ -590,6 +693,7 @@ def main() -> None:
     lowcmd_writer = None
     z1_writer = None
     vel_keyboard = None
+    ee_goal_publisher = None
     # Dry run and arm-only: always evaluate policy for printing (legs not applied in arm-only).
     apply_policy = (not args.execute_actions) or args.arm_only
     shutdown = {"stop": False}
@@ -600,6 +704,24 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, _request_shutdown)
     signal.signal(signal.SIGTERM, _request_shutdown)
+
+    stream_cfg = config.get("streaming") or {}
+    if getattr(args, "ee_goal_ws", False):
+        from streaming.ee_goal_ws_server import EeGoalWsServer
+
+        ee_host = args.ee_goal_ws_host or stream_cfg.get("host", "0.0.0.0")
+        ee_port = int(
+            args.ee_goal_ws_port
+            if args.ee_goal_ws_port is not None
+            else stream_cfg.get("port", 8770)
+        )
+        ee_rate = float(
+            args.ee_goal_ws_rate
+            if args.ee_goal_ws_rate is not None
+            else stream_cfg.get("rate_hz", 50.0)
+        )
+        ee_goal_publisher = EeGoalWsServer(host=ee_host, port=ee_port, rate_hz=ee_rate)
+        ee_goal_publisher.start()
 
     if args.arm_only:
         print("Starting Z1 arm writer (teleop Tdes mode); sport mode untouched...")
@@ -629,8 +751,8 @@ def main() -> None:
 
         print(f"  current leg_q (sim): {np.array2string(q_start, precision=3)}")
         print(f"  init_deploy_joint  : {np.array2string(q_init, precision=3)}")
-        startup_kp = float(config["control"].get("startup_kp", 1000.0))
-        startup_kd = float(config["control"].get("startup_kd", 10.0))
+        startup_kp = config["control"].get("startup_kp", 1000.0)
+        startup_kd = config["control"].get("startup_kd", 10.0)
         print("Starting lowcmd writer (sport mode still active)...")
         lowcmd_writer = B2LowCmdWriter(
             kp=startup_kp,
@@ -660,6 +782,7 @@ def main() -> None:
             rate=rate,
             dt=dt,
             shutdown=shutdown,
+            ee_goal_publisher=ee_goal_publisher,
         )
 
     if args.vel_keyboard and apply_policy and not args.arm_only:
@@ -688,10 +811,15 @@ def main() -> None:
         print(f"  legs_only      : {args.legs_only}")
         print(
             f"  gains          : "
-            f"startup Kp={config['control'].get('startup_kp', 1000.0)} "
-            f"Kd={config['control'].get('startup_kd', 10.0)}; "
-            f"policy Kp={config['control']['kp']} Kd={config['control']['kd']}"
+            f"{_format_gains('startup', config['control'].get('startup_kp', 1000.0), config['control'].get('startup_kd', 10.0), 12)}; "
+            f"{_format_gains('policy', config['control']['kp'], config['control']['kd'], 12)}"
         )
+        arm_cfg = config.get("arm_control") or {}
+        if not args.legs_only:
+            print(
+                f"  arm_gains      : mode={arm_cfg.get('mode', 'jointctrl')} "
+                f"{_format_gains('arm', arm_cfg.get('kp', [20, 30, 30, 20, 15, 10]), arm_cfg.get('kd', 2000), 6)}"
+            )
         if config.get("shutdown_joint") is not None:
             print(
                 f"  soft_shutdown  : ramp {float(config.get('shutdown_ramp_s', 3.0)):.1f}s "
@@ -700,6 +828,11 @@ def main() -> None:
     if args.arm_only:
         print("  arm_control    : Tdes (T_goal = T_init @ inv(Tdes0) @ Tdes)")
         print("  legs           : sport mode left alone")
+        arm_cfg = config.get("arm_control") or {}
+        print(
+            f"  arm_gains      : mode={arm_cfg.get('mode', 'jointctrl')} "
+            f"{_format_gains('arm', arm_cfg.get('kp', [20, 30, 30, 20, 15, 10]), arm_cfg.get('kd', 2000), 6)}"
+        )
     elif args.execute_actions and not args.legs_only:
         print("  arm_control    : Tdes (T_goal = T_init @ inv(Tdes0) @ Tdes)")
     print(f"  checkpoint     : {args.checkpoint}")
@@ -708,6 +841,11 @@ def main() -> None:
         print("  VR server      : disabled (--no-vr); EE goal held at current pose")
     else:
         print(f"  VR server      : {config['vr']['host']}:{config['vr']['port']}")
+    if ee_goal_publisher is not None:
+        print(
+            f"  EE goal WS     : ws://{ee_goal_publisher.host}:{ee_goal_publisher.port} "
+            f"@ {ee_goal_publisher.rate_hz:.1f} Hz"
+        )
     _print_command_mode(config)
     print("Press Ctrl+C to stop.\n")
 
@@ -721,6 +859,7 @@ def main() -> None:
                 continue
 
             obs_pack = obs_builder.build(robot, vr_goal)
+            _maybe_publish_ee(ee_goal_publisher, obs_pack)
             action = run_policy(policy, obs_pack["obs_vector"])
             obs_builder.update_action_history(action)
 
@@ -784,13 +923,15 @@ def main() -> None:
                     ramp_s=float(config.get("shutdown_ramp_s", 3.0)),
                     hold_s=float(config.get("shutdown_hold_s", 0.5)),
                     rate_hz=float(rate),
-                    kp=float(config.get("shutdown_kp", config["control"]["kp"])),
-                    kd=float(config.get("shutdown_kd", config["control"]["kd"])),
+                    kp=config.get("shutdown_kp", config["control"]["kp"]),
+                    kd=config.get("shutdown_kd", config["control"]["kd"]),
                 )
             except Exception as exc:
                 print(f"[safety] Soft shutdown failed ({exc}); stopping lowcmd.", flush=True)
             print("Stopping B2 lowcmd writer (damping)...", flush=True)
             lowcmd_writer.stop()
+        if ee_goal_publisher is not None:
+            ee_goal_publisher.stop()
         vr_goal.stop()
         aggregator.close()
 

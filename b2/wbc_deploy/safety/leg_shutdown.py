@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import signal
 import time
-from typing import Optional
+from typing import Optional, Sequence, Union
 
 import numpy as np
+
+GainLike = Union[float, int, Sequence[float]]
 
 
 def leg_joint_dict_to_array(cfg: dict, key: str) -> np.ndarray:
@@ -34,8 +36,8 @@ def run_leg_soft_shutdown(
     ramp_s: float = 3.0,
     hold_s: float = 0.5,
     rate_hz: float = 50.0,
-    kp: float,
-    kd: float,
+    kp: GainLike,
+    kd: GainLike,
     q_start: Optional[np.ndarray] = None,
 ) -> None:
     """Interpolate legs to ``q_goal``, hold briefly, then return (caller stops lowcmd).
@@ -58,7 +60,7 @@ def run_leg_soft_shutdown(
     rate_hz = max(1.0, float(rate_hz))
     dt = 1.0 / rate_hz
 
-    lowcmd_writer.set_gains(float(kp), float(kd))
+    lowcmd_writer.set_gains(kp, kd)
 
     abort = {"flag": False}
     prev_int = signal.getsignal(signal.SIGINT)
@@ -82,9 +84,13 @@ def run_leg_soft_shutdown(
     signal.signal(signal.SIGTERM, _on_signal)
 
     try:
+        kp_arr = np.asarray(kp, dtype=np.float64).reshape(-1)
+        kd_arr = np.asarray(kd, dtype=np.float64).reshape(-1)
+        kp_s = f"{float(kp_arr[0]):.1f}" if kp_arr.size == 1 else np.array2string(kp_arr, precision=1)
+        kd_s = f"{float(kd_arr[0]):.1f}" if kd_arr.size == 1 else np.array2string(kd_arr, precision=1)
         print(
             f"\n[safety] Soft shutdown: ramp {ramp_s:.1f}s → hold {hold_s:.1f}s "
-            f"at lay-down (Kp={kp}, Kd={kd})",
+            f"at lay-down (Kp={kp_s}, Kd={kd_s})",
             flush=True,
         )
         print(

@@ -123,7 +123,7 @@ class lambdaWBC(LeggedRobot):
         self.actions = actions.clone()
         self.arm.update_rfm_state(actions)
         all_pos_targets = self.arm.compute_pos_targets(actions)
-        all_pos_targets[:, 12:18] = self.default_dof_pos_wo_gripper[12:18]
+        # all_pos_targets[:, 12:18] = self.default_dof_pos_wo_gripper[12:18]
         # Leg PD uses an 18-wide torque vector (arm slots zeroed when unused).
         torques_actions = torch.zeros(self.num_envs, self.num_torques, device=self.device)
         n = min(self.actions.shape[-1], self.num_torques)
@@ -308,11 +308,14 @@ class lambdaWBC(LeggedRobot):
             self.projected_gravity,
             ee_goal_local_cart,
         ]
-        print("base_lin_vel[:, 0]")
-        print(self.base_lin_vel[:, 0])
-        print("pitch")
-        pitch = self._get_body_orientation()[:, 1]
-        print(pitch)
+        # print(self.dof_pos)
+        # print("base_lin_vel[:, 0]")
+        # print(self.base_lin_vel[:, 0])
+        # print("pitch")
+        # pitch = self._get_body_orientation()[:, 1]
+        # print(pitch)
+        # print(self.dvel_b_local)
+        # print(self.manip_det_pred[:, -1])
         if self.cfg.experiment.use_cmd:
             tail = [self.commands[:, :3] * self.commands_scale, self.manip_det_pred[:, -1].unsqueeze(-1)]
             # self.commands[:, :3] = 0 * self.commands[:, :3]
@@ -323,14 +326,17 @@ class lambdaWBC(LeggedRobot):
 
     def compute_observations(self):
         """ Computes observations """
-        arm_base_pos = self.base_pos + quat_apply(self.base_yaw_quat, self.arm_base_offset)
+        arm_base_pos = self.base_pos + quat_apply(self.base_quat, self.arm_base_offset)
         ee_goal_local_cart = quat_rotate_inverse(self.base_quat, self.curr_ee_goal_cart_world - arm_base_pos)
-        ee_goal_local_cart = quat_rotate_inverse(self.base_quat, self.ee_pos - arm_base_pos)
+        # ee_goal_local_cart = quat_rotate_inverse(self.base_quat, self.ee_pos - arm_base_pos) 
+        # ee_goal_local_cart[:,0] += 0.05
         self.manip.compute()
         self.manip.update_history()
         self.manip.predict()
 
         if self.stand_by:
+            self.commands[:] = 0.
+        if not self.cfg.experiment.use_cmd:
             self.commands[:] = 0.
         
         obs_buf = self._build_proprio_obs(ee_goal_local_cart)
@@ -637,7 +643,7 @@ class lambdaWBC(LeggedRobot):
         dof_props_asset = self.gym.get_asset_dof_properties(robot_asset)
         dof_props_asset['driveMode'][12:].fill(gymapi.DOF_MODE_POS)  # set arm to pos control
         dof_props_asset['stiffness'][12:].fill(400.0)
-        dof_props_asset['damping'][12:].fill(40.0)
+        dof_props_asset['damping'][12:].fill(20.0)
         # dof_props_asset['driveMode'][:].fill(gymapi.DOF_MODE_EFFORT)  # set all joints to pos control
         # dof_props_asset['stiffness'][:].fill(100.0)
         # dof_props_asset['damping'][:].fill(5.0)
@@ -1355,10 +1361,14 @@ class lambdaWBC(LeggedRobot):
             ee_target_cart = sphere2cart(ee_target_all_sphere[..., i])
             if self.cfg.experiment.fix_sample:
                 ee_target_all_cart_world[..., i] = quat_apply(self.base_yaw_quat_fixed, ee_target_cart)
+            elif getattr(self.cfg.experiment, "base_sample", False):
+                ee_target_all_cart_world[..., i] = quat_apply(self.base_quat, ee_target_cart)
             else:
                 ee_target_all_cart_world[..., i] = quat_apply(self.base_yaw_quat, ee_target_cart)
         if self.cfg.experiment.fix_sample:
             ee_target_all_cart_world += self.centers_fixed[:, :, None]
+        elif getattr(self.cfg.experiment, "base_sample", False):
+            ee_target_all_cart_world += self.ee_goals.get_arm_base_pos()[:, :, None]
         else:
             ee_target_all_cart_world += self.ee_goals.get_spherical_center()[:, :, None]
         for i in range(self.num_envs):

@@ -1,0 +1,8 @@
+h5py>=3.6
+numpy>=1.20
+PyYAML>=5.4
+websockets>=10.0
+# Intel RealSense Python wrapper (may need librealsense system install):
+pyrealsense2>=2.50
+# Optional if camera negotiates a non-640x480 color stream:
+opencv-python-headless>=4.5

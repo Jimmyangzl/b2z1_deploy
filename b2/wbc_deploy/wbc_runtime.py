@@ -64,6 +64,28 @@ def build_arg_parser(description: str, *, require_checkpoint: bool = False) -> a
         action="store_true",
         help="Disable VR WebSocket; hold EE goal at current pose (NullVrGoalProvider)",
     )
+    parser.add_argument(
+        "--ee-goal-ws",
+        action="store_true",
+        help="Broadcast ee_goal_local_cart over WebSocket for data_record clients",
+    )
+    parser.add_argument(
+        "--ee-goal-ws-host",
+        default=None,
+        help="EE-goal WS bind host (default: streaming.host or 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--ee-goal-ws-port",
+        type=int,
+        default=None,
+        help="EE-goal WS bind port (default: streaming.port or 8770)",
+    )
+    parser.add_argument(
+        "--ee-goal-ws-rate",
+        type=float,
+        default=None,
+        help="EE-goal WS broadcast rate Hz (default: streaming.rate_hz or 50)",
+    )
     return parser
 
 

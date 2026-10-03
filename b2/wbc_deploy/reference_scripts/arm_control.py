@@ -6,12 +6,22 @@ from isaacgym.torch_utils import *
 class ArmController:
     """Arm IK, RFM phase logic, and locomotion command generation for lambdaWBC."""
 
+    ARM_JOINT_NAMES = (
+        "z1_waist",
+        "z1_shoulder",
+        "z1_elbow",
+        "z1_wrist_angle",
+        "z1_forearm_roll",
+        "z1_wrist_rotate",
+    )
+
     def __init__(self, env):
         self.env = env
+        defaults = env.cfg.init_state.default_joint_angles
         self.arm_home_joint = torch.tensor(
-            # [0.0, 2 * np.pi / 3, -2 * np.pi / 3, -0.0, 0.0, 1.57], device=env.device,
-            # [0.0, 0.6, -0.6, -0.0, 0.0, 1.57], device=env.device,
-            [0.0, 1.8, -1.8, -0.0, 0.0, 0], device=env.device,
+            [float(defaults[name]) for name in self.ARM_JOINT_NAMES],
+            device=env.device,
+            dtype=torch.float,
         )
 
     @property
@@ -71,7 +81,13 @@ class ArmController:
             dpos_xy_norm = torch.norm(dpos[:, :2], p=2, dim=1)
             self.phase_variable = 1.0 / (1 + torch.exp(-5 * (dpos_xy_norm - 1.0) / 1.0))
 
-        if not self.cfg.experiment.fix_sample:
+        # dvel is used for RFM locomotion obs/rewards when use_cmd=False.
+        # Previously gated on fix_sample only, which left dvel=0 under base_sample.
+        need_dvel = (not self.cfg.experiment.use_cmd) and (
+            self.cfg.experiment.fix_sample
+            or bool(getattr(self.cfg.experiment, "base_sample", False))
+        )
+        if not need_dvel:
             return
 
         dpos_b_world = env.curr_ee_goal_cart_world.clone() - env.base_pos.clone()
@@ -87,8 +103,9 @@ class ArmController:
             torch.cos(ee_goal_yaw - env.base_yaw_euler[:, 2]),
         )
         ee_euler_error = torch.abs(yaw_diff)
+        # self.phase_variable = 0.3
         mask_xy = (
-            (env.manip.manip_det_pred[:, -1] > 0.0001) & (self.phase_variable < 0.5)
+            (env.manip.manip_det_pred[:, -1] > 0.0003) & (self.phase_variable < 0.5)
         ).unsqueeze(-1).expand_as(self.dvel_b_local[:, :2])
         mask_yaw = (
             # (env.manip.manip_det_pred[:, -1] < 0.001)
@@ -97,11 +114,15 @@ class ArmController:
             (ee_euler_error > 0.785)
         )
         # print(mask_yaw)
-        
-        arm_base_pos = env.base_pos + quat_apply(env.base_yaw_quat, env.arm_base_offset)
+
+        if bool(getattr(self.cfg.experiment, "base_sample", False)):
+            arm_base_pos = env.base_pos + quat_apply(env.base_quat, env.arm_base_offset)
+        else:
+            arm_base_pos = env.base_pos + quat_apply(env.base_yaw_quat, env.arm_base_offset)
         dist_base_ee = torch.norm(env.ee_pos[:, :2] - arm_base_pos[:, :2], p=2, dim=1)
+
         mask_back = (
-            (env.manip.manip_det_pred[:, -1] < 0.001)
+            (env.manip.manip_det_pred[:, -1] < 0.0003)
             & (dist_base_ee < 0.4)
             & (self.phase_variable < 0.5)
         ).unsqueeze(-1).expand_as(self.dvel_b_local[:, :2])
@@ -148,6 +169,9 @@ class ArmController:
             climb_mask = env.env_mode != env.MODE_WALK
             if climb_mask.any():
                 arm_pos_targets[climb_mask] = env.default_dof_pos[arm_slice]
+
+        # z1_elbow (arm index 2): keep above URDF lower limit.
+        arm_pos_targets[:, 2] = torch.clamp(arm_pos_targets[:, 2], min=-3.0)
 
         all_pos_targets = torch.zeros_like(env.dof_pos)
         all_pos_targets[:, arm_slice] = arm_pos_targets

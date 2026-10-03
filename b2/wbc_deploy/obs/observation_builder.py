@@ -59,6 +59,10 @@ class ObservationBuilder:
         self.lin_vel_y_clip = float(cmd_cfg.get("lin_vel_y_clip", 0.1))
         self.ang_vel_yaw_clip = float(cmd_cfg.get("ang_vel_yaw_clip", 0.05))
 
+        rfm_cfg = config.get("rfm", {})
+        self.dvel_xy_amp = float(rfm_cfg.get("dvel_xy_amp", 0.15))
+        self.dvel_yaw_amp = float(rfm_cfg.get("dvel_yaw_amp", 0.4))
+
         angles = robot_cfg["default_joint_angles"]
         self.default_dof_pos = default_dof_pos_from_config(angles)
 
@@ -118,11 +122,11 @@ class ObservationBuilder:
         """Build phase_variable and dvel_b_local to match Isaac arm_control RFM.
 
         dvel (when VR active):
-          xy = 0.2 * unit(goal in base_yaw xy)
-          yaw = 0.4 * sign(goal_yaw - base_yaw)
+          xy = dvel_xy_amp * unit(goal in base_yaw xy)
+          yaw = dvel_yaw_amp * sign(goal_yaw - base_yaw)
         masks (same as arm_control.update_rfm_state):
-          mask_xy:   manip_pred > 1e-4 and phase < 0.5  → zero xy
-          mask_back: manip_pred < 1e-3 and dist(ee, mount)_xy < 0.4 and phase < 0.5
+          mask_xy:   manip_pred > 3e-4 and phase < 0.5  → zero xy
+          mask_back: manip_pred < 3e-4 and dist(ee, mount)_xy < 0.4 and phase < 0.5
                      → flip xy
           mask_yaw:  |yaw_err| > 0.785  → keep yaw; else zero yaw
         """
@@ -140,7 +144,7 @@ class ObservationBuilder:
         self.dpos_b_local = goal_yaw_pos.copy()
         dvel_norm = float(np.linalg.norm(self.dpos_b_local[:2]))
         if dvel_norm > 1e-8:
-            self.dvel_b_local[:2] = 0.2 * self.dpos_b_local[:2] / dvel_norm
+            self.dvel_b_local[:2] = self.dvel_xy_amp * self.dpos_b_local[:2] / dvel_norm
         else:
             self.dvel_b_local[:2] = 0.0
 
@@ -158,16 +162,16 @@ class ObservationBuilder:
             math.cos(ee_goal_yaw - base_yaw),
         )
         yaw_direction = float(np.sign(yaw_diff)) if abs(yaw_diff) > 1e-8 else 0.0
-        self.dvel_b_local[2] = 0.4 * yaw_direction
+        self.dvel_b_local[2] = self.dvel_yaw_amp * yaw_direction
         ee_euler_error = abs(yaw_diff)
 
-        mask_xy = (manip_pred_last > 0.0001) and (self.phase_variable < 0.5)
+        mask_xy = (manip_pred_last > 0.0003) and (self.phase_variable < 0.5)
         mask_yaw = ee_euler_error > 0.785
 
         arm_mount_yaw = self._base_to_base_yaw_pos(self.policy_arm_base_offset, base_quat)
         dist_base_ee = float(np.linalg.norm((ee_yaw - arm_mount_yaw)[:2]))
         mask_back = (
-            (manip_pred_last < 0.001)
+            (manip_pred_last < 0.0003)
             and (dist_base_ee < 0.4)
             and (self.phase_variable < 0.5)
         )
