@@ -5,10 +5,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import signal
 import sys
 import time
-from datetime import datetime
 
 import numpy as np
 import yaml
@@ -30,6 +30,7 @@ from robot.b2_dds_reader import B2DdsReader
 from storage.h5_writer import H5SessionWriter
 
 DEFAULT_CONFIG = os.path.join(DATA_RECORD_ROOT, "config", "record.yaml")
+_EPISODE_RE = re.compile(r"^episode_(\d+)\.h5$")
 
 
 def _load_config(path: str) -> dict:
@@ -43,14 +44,60 @@ def _sleep_to(deadline: float) -> None:
         time.sleep(remaining)
 
 
+def _validate_task_name(task: str) -> str:
+    task = str(task).strip()
+    if not task:
+        raise ValueError("task name must be non-empty")
+    if task in (".", "..") or "/" in task or "\\" in task:
+        raise ValueError(
+            f"invalid task name {task!r}: use a single folder name (e.g. task_1)"
+        )
+    return task
+
+
+def _next_episode_index(task_dir: str) -> int:
+    """Return the next unused episode index under task_dir (0 if empty)."""
+    if not os.path.isdir(task_dir):
+        return 0
+    max_idx = -1
+    for name in os.listdir(task_dir):
+        m = _EPISODE_RE.match(name)
+        if m:
+            max_idx = max(max_idx, int(m.group(1)))
+    return max_idx + 1
+
+
+def _resolve_out_path(task: str, out_dir: str, out_override: str | None) -> tuple[str, int | None]:
+    """Return (absolute .h5 path, episode index or None if --out override)."""
+    if out_override:
+        return os.path.abspath(out_override), None
+
+    task = _validate_task_name(task)
+    if not os.path.isabs(out_dir):
+        out_dir = os.path.join(DATA_RECORD_ROOT, out_dir)
+    task_dir = os.path.join(out_dir, task)
+    os.makedirs(task_dir, exist_ok=True)
+    ep = _next_episode_index(task_dir)
+    return os.path.join(task_dir, f"episode_{ep}.h5"), ep
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="B2Z1 data recording session")
+    parser.add_argument(
+        "--task",
+        required=True,
+        help="Task name; episodes saved under recordings/<task>/episode_N.h5",
+    )
     parser.add_argument("--config", default=DEFAULT_CONFIG, help="Path to record.yaml")
     parser.add_argument("--interface", default=None, help="B2 NIC (default from yaml)")
     parser.add_argument("--ee-ws-host", default=None, help="WBC EE-goal WS host")
     parser.add_argument("--ee-ws-port", type=int, default=None, help="WBC EE-goal WS port")
     parser.add_argument("--rate", type=float, default=None, help="Record rate Hz (default 20)")
-    parser.add_argument("--out", default=None, help="Output .h5 path (default auto under out_dir)")
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Optional explicit .h5 path (skips recordings/<task>/episode_N.h5)",
+    )
     parser.add_argument(
         "--no-camera",
         action="store_true",
@@ -91,14 +138,13 @@ def main() -> int:
     cam_fps = int(cam_cfg.get("fps", 30))
     cam_serial = cam_cfg.get("serial")
 
-    if args.out:
-        out_path = os.path.abspath(args.out)
-    else:
-        out_dir = rec.get("out_dir", "recordings")
-        if not os.path.isabs(out_dir):
-            out_dir = os.path.join(DATA_RECORD_ROOT, out_dir)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = os.path.join(out_dir, f"session_{stamp}.h5")
+    try:
+        out_path, episode_idx = _resolve_out_path(
+            args.task, rec.get("out_dir", "recordings"), args.out
+        )
+    except ValueError as exc:
+        print(f"[record_session] error: {exc}", flush=True)
+        return 2
 
     dt = 1.0 / max(1e-3, rate_hz)
     stop = {"flag": False}
@@ -149,8 +195,14 @@ def main() -> int:
             camera_serial=cam_serial_used or "",
         )
 
+        ep_msg = (
+            f"episode_{episode_idx}"
+            if episode_idx is not None
+            else "custom --out"
+        )
         print(
-            f"[record_session] writing {out_path} @ {rate_hz:.1f} Hz\n"
+            f"[record_session] task={args.task} ({ep_msg})\n"
+            f"  writing {out_path} @ {rate_hz:.1f} Hz\n"
             f"  EE WS : {'disabled' if args.no_ee else ee_ws_url}\n"
             f"  B2    : {'disabled' if args.no_b2 else interface}\n"
             f"  camera: {'disabled' if args.no_camera else cam_serial_used}",

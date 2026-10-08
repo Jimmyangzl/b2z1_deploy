@@ -41,12 +41,16 @@ python scripts/deploy_wbc.py --interface enp8s0 --ee-goal-ws \
 ```bash
 cd ~/unitree_deploy/b2z1_deploy/data_record
 python scripts/record_session.py \
+  --task task_1 \
   --interface enp8s0 \
   --ee-ws-host <WBC_LAPTOP_IP> \
   --ee-ws-port 8770 \
-  --rate 20 \
-  --out recordings/session.h5
+  --rate 20
 ```
+
+`--task` is required. Each run creates the next episode under
+`recordings/<task>/episode_0.h5`, `episode_1.h5`, … (folder is created if missing).
+Optional `--out path.h5` overrides the auto episode path.
 
 Ctrl+C stops cleanly and flushes the HDF5 file.
 
@@ -54,10 +58,13 @@ Ctrl+C stops cleanly and flushes the HDF5 file.
 
 ```bash
 # Camera + WS only (no DDS):
-python scripts/record_session.py --no-b2 --ee-ws-host 127.0.0.1 --rate 5
+python scripts/record_session.py --task dry_run --no-b2 --ee-ws-host 127.0.0.1 --rate 5
 
 # Networking only (black frames):
-python scripts/record_session.py --no-camera --no-b2 --ee-ws-host 127.0.0.1 --rate 5
+python scripts/record_session.py --task dry_run --no-camera --no-b2 --ee-ws-host 127.0.0.1 --rate 5
+
+# Image only:
+python scripts/record_session.py --task task_1 --no-b2 --no-ee --rate 20
 ```
 
 ## HDF5 layout
