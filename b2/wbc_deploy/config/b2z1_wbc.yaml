@@ -182,7 +182,7 @@ init_deploy_joint:
                 
 
 init_deploy_ramp_s: 5.0
-init_deploy_hold_s: 5.0
+init_deploy_hold_s: 2.0
 
 # Soft-land target on Ctrl+C / stop while lowcmd is active (sim order, rad).
 # Captured from a physical lay-down pose; interp uses policy Kp/Kd.
