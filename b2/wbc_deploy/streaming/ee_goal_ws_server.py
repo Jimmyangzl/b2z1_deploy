@@ -52,7 +52,7 @@ class EeGoalWsServer:
         """Store latest EE goal and Z1 gripper command.
 
         ``gripper_cmd`` is the latched position sent to ``setGripperCmd``
-        (closed=0, open=-1). ``None`` means the command is unavailable.
+        (closed=0.2, open=-1). ``None`` means the command is unavailable.
         """
         goal = np.asarray(ee_goal_local_cart, dtype=np.float64).reshape(3)
         if gripper_cmd is None:
