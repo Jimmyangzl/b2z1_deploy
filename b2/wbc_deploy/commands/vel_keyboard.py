@@ -46,6 +46,7 @@ class DeployHotkeys:
         self._thread: Optional[threading.Thread] = None
         self._old_term: Optional[list] = None
         self._lock = threading.Lock()
+        self._paused = False
 
     def set_velocity_enabled(
         self,
@@ -92,6 +93,26 @@ class DeployHotkeys:
             self._thread.join(timeout=1.0)
             self._thread = None
         self._restore_terminal()
+
+    def pause_for_input(self) -> None:
+        """Stop cbreak listener so cooked ``input()`` can read a full line (e.g. YES)."""
+        was_running = self._thread is not None and self._thread.is_alive()
+        self.stop()
+        self._paused = was_running
+        # Drop any leftover keystrokes queued while in cbreak.
+        if sys.stdin.isatty():
+            try:
+                termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+            except Exception:
+                pass
+
+    def resume_after_input(self) -> None:
+        """Restart after ``pause_for_input`` if it was previously running."""
+        if not self._paused:
+            return
+        self._paused = False
+        self._stop.clear()
+        self.start()
 
     def _notify_vel(self) -> None:
         cb = self.on_vel_update

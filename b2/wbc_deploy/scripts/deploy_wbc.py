@@ -509,6 +509,7 @@ def run_init_deploy_sequence(
     dt: float,
     shutdown: dict,
     ee_goal_publisher=None,
+    hotkeys: Optional[DeployHotkeys] = None,
 ) -> bool:
     """Ramp to init_deploy_joint, hold while printing obs, then confirm policy.
 
@@ -601,6 +602,9 @@ def run_init_deploy_sequence(
         "Type YES to start sending policy leg actions to the robot.\n"
         "Anything else keeps holding init_deploy_joint."
     )
+    # Hotkeys own stdin in cbreak and would steal YES keystrokes — pause first.
+    if hotkeys is not None:
+        hotkeys.pause_for_input()
     # Temporarily restore default SIGINT so Ctrl+C during input works cleanly.
     prev_handler = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -612,9 +616,14 @@ def run_init_deploy_sequence(
         return False
     finally:
         signal.signal(signal.SIGINT, prev_handler)
+        if hotkeys is not None:
+            hotkeys.resume_after_input()
 
     if confirm.strip() != "YES":
-        print("Keeping legs at init_deploy_joint (policy commands disabled).")
+        print(
+            f"Keeping legs at init_deploy_joint (policy commands disabled). "
+            f"Got {confirm!r}; need exact YES."
+        )
         return False
 
     print("Confirmed. Switching to policy gains and applying policy actions.")
@@ -849,6 +858,7 @@ def main() -> None:
             dt=dt,
             shutdown=shutdown,
             ee_goal_publisher=ee_goal_publisher,
+            hotkeys=hotkeys,
         )
 
     # Enable velocity keys on the same stdin listener (space remains gripper-only).
