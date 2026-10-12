@@ -82,6 +82,13 @@ class H5SessionWriter:
             dtype=np.float64,
             chunks=(chunk, 4),
         )
+        self._gripper = self._f.create_dataset(
+            "gripper_cmd",
+            shape=(0,),
+            maxshape=(None,),
+            dtype=np.float64,
+            chunks=(chunk,),
+        )
 
     @property
     def num_frames(self) -> int:
@@ -96,6 +103,7 @@ class H5SessionWriter:
         ee_goal_age_s: float,
         base_lin_vel_local: np.ndarray,
         base_quat: np.ndarray,
+        gripper_cmd: float = float("nan"),
     ) -> None:
         rgb = np.asarray(rgb, dtype=np.uint8)
         if rgb.shape != (self._height, self._width, 3):
@@ -114,6 +122,7 @@ class H5SessionWriter:
             self._ee_age,
             self._vel,
             self._quat,
+            self._gripper,
         ):
             ds.resize(i + 1, axis=0)
 
@@ -123,6 +132,7 @@ class H5SessionWriter:
         self._ee_age[i] = float(ee_goal_age_s)
         self._vel[i] = vel
         self._quat[i] = quat
+        self._gripper[i] = float(gripper_cmd)
         self._n = i + 1
 
         if self._n % 50 == 0:

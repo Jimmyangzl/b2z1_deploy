@@ -35,6 +35,7 @@ class EeGoalWsServer:
         self.rate_hz = max(1e-3, float(rate_hz))
         self._lock = threading.Lock()
         self._ee_goal = np.full(3, np.nan, dtype=np.float64)
+        self._gripper_cmd = float("nan")
         self._t = 0.0
         self._have_sample = False
         self._clients: Set[WebSocketServerProtocol] = set()
@@ -42,11 +43,25 @@ class EeGoalWsServer:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._stop = threading.Event()
 
-    def update(self, ee_goal_local_cart, timestamp: Optional[float] = None) -> None:
-        """Store latest EE goal (robot arm-base / mount frame, 3-vector)."""
+    def update(
+        self,
+        ee_goal_local_cart,
+        timestamp: Optional[float] = None,
+        gripper_cmd: Optional[float] = None,
+    ) -> None:
+        """Store latest EE goal and Z1 gripper command.
+
+        ``gripper_cmd`` is the latched position sent to ``setGripperCmd``
+        (closed=0, open=-1). ``None`` means the command is unavailable.
+        """
         goal = np.asarray(ee_goal_local_cart, dtype=np.float64).reshape(3)
+        if gripper_cmd is None:
+            grip = float("nan")
+        else:
+            grip = float(gripper_cmd)
         with self._lock:
             self._ee_goal = goal.copy()
+            self._gripper_cmd = grip
             self._t = float(time.time() if timestamp is None else timestamp)
             self._have_sample = True
 
@@ -55,6 +70,7 @@ class EeGoalWsServer:
             return {
                 "t": self._t,
                 "ee_goal_local_cart": self._ee_goal.tolist(),
+                "gripper_cmd": self._gripper_cmd,
                 "valid": bool(self._have_sample and np.all(np.isfinite(self._ee_goal))),
             }
 

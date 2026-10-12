@@ -75,6 +75,7 @@ python scripts/record_session.py --task task_1 --no-b2 --no-ee --rate 20
 | `rgb` | `(N, 480, 640, 3)` | RGB uint8 |
 | `ee_goal_local_cart` | `(N, 3)` | NaN if stale/missing |
 | `ee_goal_age_s` | `(N,)` | Age of EE sample vs wall time |
+| `gripper_cmd` | `(N,)` | Z1 gripper command: `0` closed, `-1` open. NaN if missing/stale |
 | `base_lin_vel_local` | `(N, 3)` | From sport velocity |
 | `base_quat` | `(N, 4)` | IMU wxyz |
 

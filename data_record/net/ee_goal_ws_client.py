@@ -26,6 +26,7 @@ class EeGoalWsClient:
         self._latest = {
             "valid": False,
             "ee_goal_local_cart": np.full(3, np.nan, dtype=np.float64),
+            "gripper_cmd": float("nan"),
             "t": 0.0,
             "recv_t": 0.0,
         }
@@ -71,6 +72,7 @@ class EeGoalWsClient:
                     {
                         "valid": False,
                         "ee_goal_local_cart": np.full(3, np.nan, dtype=np.float64),
+                        "gripper_cmd": float("nan"),
                         "t": 0.0,
                         "recv_t": time.time(),
                     }
@@ -92,10 +94,13 @@ class EeGoalWsClient:
                     if goal is None
                     else np.asarray(goal, dtype=np.float64).reshape(3)
                 )
+                raw_grip = data.get("gripper_cmd")
+                gripper_cmd = float("nan") if raw_grip is None else float(raw_grip)
                 self._set_latest(
                     {
                         "valid": bool(data.get("valid", np.all(np.isfinite(goal_arr)))),
                         "ee_goal_local_cart": goal_arr,
+                        "gripper_cmd": gripper_cmd,
                         "t": float(data.get("t", time.time())),
                         "recv_t": time.time(),
                     }

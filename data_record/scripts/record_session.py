@@ -234,16 +234,21 @@ def main() -> int:
             if ee_client is not None:
                 ee = ee_client.get_latest()
                 ee_goal = ee["ee_goal_local_cart"]
-                if ee.get("valid") and ee.get("t", 0.0) > 0:
+                gripper_cmd = float(ee.get("gripper_cmd", float("nan")))
+                if ee.get("t", 0.0) > 0:
                     age = wall_t - float(ee["t"])
                 else:
                     age = float("inf")
-                if age > stale_s or not ee.get("valid"):
+                fresh = np.isfinite(age) and age <= stale_s
+                if not fresh or not ee.get("valid"):
                     ee_goal = np.full(3, np.nan, dtype=np.float64)
                     age = float("nan") if not np.isfinite(age) else age
+                if not fresh or not np.isfinite(gripper_cmd):
+                    gripper_cmd = float("nan")
             else:
                 ee_goal = np.full(3, np.nan, dtype=np.float64)
                 age = float("nan")
+                gripper_cmd = float("nan")
 
             writer.append(
                 timestamp=wall_t,
@@ -252,12 +257,14 @@ def main() -> int:
                 ee_goal_age_s=age if np.isfinite(age) else float("nan"),
                 base_lin_vel_local=base_vel,
                 base_quat=base_quat,
+                gripper_cmd=gripper_cmd,
             )
 
             if writer.num_frames % max(1, int(rate_hz)) == 0:
                 print(
                     f"[record_session] frames={writer.num_frames} "
                     f"ee={np.array2string(ee_goal, precision=3)} "
+                    f"grip={gripper_cmd:.1f} "
                     f"vel={np.array2string(base_vel, precision=3)}",
                     flush=True,
                 )

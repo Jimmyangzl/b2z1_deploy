@@ -35,13 +35,13 @@ from utils.math_utils import pos_quat_to_homogeneous
 from wbc_runtime import build_arg_parser, load_runtime, print_obs_summary, run_policy
 
 
-def _maybe_publish_ee(publisher, obs_pack: dict) -> None:
+def _maybe_publish_ee(publisher, obs_pack: dict, gripper_cmd=None) -> None:
     if publisher is None:
         return
     goal = obs_pack.get("ee_goal_local_cart")
     if goal is None:
         return
-    publisher.update(goal)
+    publisher.update(goal, gripper_cmd=gripper_cmd)
 
 
 def _print_command_mode(config: dict) -> None:
@@ -537,7 +537,11 @@ def run_init_deploy_sequence(
         robot = aggregator.read()
         if robot.valid:
             obs_pack = obs_builder.build(robot, vr_goal)
-            _maybe_publish_ee(ee_goal_publisher, obs_pack)
+            _maybe_publish_ee(
+                ee_goal_publisher,
+                obs_pack,
+                None if z1_writer is None else z1_writer.gripper_command(),
+            )
             action = run_policy(policy, obs_pack["obs_vector"])
             obs_builder.update_action_history(action)
             if z1_writer is not None:
@@ -568,7 +572,11 @@ def run_init_deploy_sequence(
         robot = aggregator.read()
         if robot.valid:
             obs_pack = obs_builder.build(robot, vr_goal)
-            _maybe_publish_ee(ee_goal_publisher, obs_pack)
+            _maybe_publish_ee(
+                ee_goal_publisher,
+                obs_pack,
+                None if z1_writer is None else z1_writer.gripper_command(),
+            )
             action = run_policy(policy, obs_pack["obs_vector"])
             obs_builder.update_action_history(action)
             if z1_writer is not None:
@@ -933,7 +941,11 @@ def main() -> None:
                 continue
 
             obs_pack = obs_builder.build(robot, vr_goal)
-            _maybe_publish_ee(ee_goal_publisher, obs_pack)
+            _maybe_publish_ee(
+                ee_goal_publisher,
+                obs_pack,
+                None if z1_writer is None else z1_writer.gripper_command(),
+            )
             action = run_policy(policy, obs_pack["obs_vector"])
             obs_builder.update_action_history(action)
 
