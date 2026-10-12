@@ -36,6 +36,8 @@ class EeGoalWsServer:
         self._lock = threading.Lock()
         self._ee_goal = np.full(3, np.nan, dtype=np.float64)
         self._gripper_cmd = float("nan")
+        self._base_lin_vel = np.full(3, np.nan, dtype=np.float64)
+        self._ee_goal_quat = np.full(4, np.nan, dtype=np.float64)
         self._t = 0.0
         self._have_sample = False
         self._clients: Set[WebSocketServerProtocol] = set()
@@ -48,20 +50,35 @@ class EeGoalWsServer:
         ee_goal_local_cart,
         timestamp: Optional[float] = None,
         gripper_cmd: Optional[float] = None,
+        base_lin_vel=None,
+        ee_goal_quat_base=None,
     ) -> None:
-        """Store latest EE goal and Z1 gripper command.
+        """Store latest EE goal, Z1 gripper command, and base linear velocity.
 
         ``gripper_cmd`` is the latched position sent to ``setGripperCmd``
-        (closed=0.2, open=-1). ``None`` means the command is unavailable.
+        (closed=0.2, open=-1). ``base_lin_vel`` is the same 3-vector printed
+        as ``base_lin_vel`` in the WBC observation summary.
+        ``ee_goal_quat_base`` is the EE target orientation, wxyz, in the robot
+        base frame. ``None`` means that field is unavailable.
         """
         goal = np.asarray(ee_goal_local_cart, dtype=np.float64).reshape(3)
         if gripper_cmd is None:
             grip = float("nan")
         else:
             grip = float(gripper_cmd)
+        if base_lin_vel is None:
+            vel = np.full(3, np.nan, dtype=np.float64)
+        else:
+            vel = np.asarray(base_lin_vel, dtype=np.float64).reshape(3).copy()
+        if ee_goal_quat_base is None:
+            quat = np.full(4, np.nan, dtype=np.float64)
+        else:
+            quat = np.asarray(ee_goal_quat_base, dtype=np.float64).reshape(4).copy()
         with self._lock:
             self._ee_goal = goal.copy()
             self._gripper_cmd = grip
+            self._base_lin_vel = vel
+            self._ee_goal_quat = quat
             self._t = float(time.time() if timestamp is None else timestamp)
             self._have_sample = True
 
@@ -70,7 +87,9 @@ class EeGoalWsServer:
             return {
                 "t": self._t,
                 "ee_goal_local_cart": self._ee_goal.tolist(),
+                "ee_goal_quat_base": self._ee_goal_quat.tolist(),
                 "gripper_cmd": self._gripper_cmd,
+                "base_lin_vel": self._base_lin_vel.tolist(),
                 "valid": bool(self._have_sample and np.all(np.isfinite(self._ee_goal))),
             }
 

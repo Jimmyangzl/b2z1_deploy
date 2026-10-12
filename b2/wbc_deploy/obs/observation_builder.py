@@ -236,6 +236,9 @@ class ObservationBuilder:
         self._update_rfm_state(robot, vr_goal, manip_pred_last)
 
         ee_goal_local_cart = self._ee_goal_local_cart(goal_base)
+        goal_quat_base = getattr(vr_goal, "ee_quat_goal_base", None)
+        if goal_quat_base is None:
+            goal_quat_base = np.full(4, np.nan, dtype=np.float64)
         # ee_goal_local_cart[0] = 0.4 
         # ee_goal_local_cart[2] = 0.4 
 
@@ -297,6 +300,8 @@ class ObservationBuilder:
             "history": history_flat,
             "slices": slices,
             "ee_goal_local_cart": ee_goal_local_cart,
+            "ee_goal_quat_base": np.asarray(goal_quat_base, dtype=np.float64).reshape(4).copy(),
+            "base_lin_vel": np.asarray(base_lin_vel, dtype=np.float64).copy(),
             "ee_goal_base": goal_base,
             "ee_goal_world": goal_base,  # back-compat alias (base frame, not sport world)
             "dvel_b_local": self.dvel_b_local.copy(),

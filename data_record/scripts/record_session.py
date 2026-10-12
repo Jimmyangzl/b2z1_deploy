@@ -235,6 +235,9 @@ def main() -> int:
                 ee = ee_client.get_latest()
                 ee_goal = ee["ee_goal_local_cart"]
                 gripper_cmd = float(ee.get("gripper_cmd", float("nan")))
+                ee_quat = ee.get("ee_goal_quat_base")
+                if ee_quat is not None:
+                    ee_quat = np.asarray(ee_quat, dtype=np.float64).reshape(4)
                 if ee.get("t", 0.0) > 0:
                     age = wall_t - float(ee["t"])
                 else:
@@ -245,10 +248,22 @@ def main() -> int:
                     age = float("nan") if not np.isfinite(age) else age
                 if not fresh or not np.isfinite(gripper_cmd):
                     gripper_cmd = float("nan")
+                if ee_quat is None or not fresh or not np.all(np.isfinite(ee_quat)):
+                    ee_quat = np.full(4, np.nan, dtype=np.float64)
+                # Same vector WBC prints as base_lin_vel. Prefer it over the
+                # local sport-topic read, which stays zero after ReleaseMode.
+                ws_vel = ee.get("base_lin_vel")
+                if ws_vel is not None:
+                    ws_vel = np.asarray(ws_vel, dtype=np.float64).reshape(3)
+                    if fresh and np.all(np.isfinite(ws_vel)):
+                        base_vel = ws_vel
+                    else:
+                        base_vel = np.full(3, np.nan, dtype=np.float64)
             else:
                 ee_goal = np.full(3, np.nan, dtype=np.float64)
                 age = float("nan")
                 gripper_cmd = float("nan")
+                ee_quat = np.full(4, np.nan, dtype=np.float64)
 
             writer.append(
                 timestamp=wall_t,
@@ -258,6 +273,7 @@ def main() -> int:
                 base_lin_vel_local=base_vel,
                 base_quat=base_quat,
                 gripper_cmd=gripper_cmd,
+                ee_goal_quat_base=ee_quat,
             )
 
             if writer.num_frames % max(1, int(rate_hz)) == 0:

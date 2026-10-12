@@ -41,7 +41,12 @@ def _maybe_publish_ee(publisher, obs_pack: dict, gripper_cmd=None) -> None:
     goal = obs_pack.get("ee_goal_local_cart")
     if goal is None:
         return
-    publisher.update(goal, gripper_cmd=gripper_cmd)
+    publisher.update(
+        goal,
+        gripper_cmd=gripper_cmd,
+        base_lin_vel=obs_pack.get("base_lin_vel"),
+        ee_goal_quat_base=obs_pack.get("ee_goal_quat_base"),
+    )
 
 
 def _print_command_mode(config: dict) -> None:

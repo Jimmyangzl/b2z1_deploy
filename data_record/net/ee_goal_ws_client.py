@@ -27,6 +27,8 @@ class EeGoalWsClient:
             "valid": False,
             "ee_goal_local_cart": np.full(3, np.nan, dtype=np.float64),
             "gripper_cmd": float("nan"),
+            "base_lin_vel": None,
+            "ee_goal_quat_base": None,
             "t": 0.0,
             "recv_t": 0.0,
         }
@@ -56,6 +58,14 @@ class EeGoalWsClient:
             out["ee_goal_local_cart"] = np.asarray(
                 out["ee_goal_local_cart"], dtype=np.float64
             ).copy()
+            if out.get("base_lin_vel") is not None:
+                out["base_lin_vel"] = np.asarray(
+                    out["base_lin_vel"], dtype=np.float64
+                ).copy()
+            if out.get("ee_goal_quat_base") is not None:
+                out["ee_goal_quat_base"] = np.asarray(
+                    out["ee_goal_quat_base"], dtype=np.float64
+                ).copy()
             return out
 
     def _set_latest(self, payload: dict) -> None:
@@ -73,6 +83,8 @@ class EeGoalWsClient:
                         "valid": False,
                         "ee_goal_local_cart": np.full(3, np.nan, dtype=np.float64),
                         "gripper_cmd": float("nan"),
+                        "base_lin_vel": None,
+                        "ee_goal_quat_base": None,
                         "t": 0.0,
                         "recv_t": time.time(),
                     }
@@ -96,11 +108,25 @@ class EeGoalWsClient:
                 )
                 raw_grip = data.get("gripper_cmd")
                 gripper_cmd = float("nan") if raw_grip is None else float(raw_grip)
+                raw_vel = data.get("base_lin_vel")
+                base_lin_vel = (
+                    None
+                    if raw_vel is None
+                    else np.asarray(raw_vel, dtype=np.float64).reshape(3)
+                )
+                raw_quat = data.get("ee_goal_quat_base")
+                ee_goal_quat = (
+                    None
+                    if raw_quat is None
+                    else np.asarray(raw_quat, dtype=np.float64).reshape(4)
+                )
                 self._set_latest(
                     {
                         "valid": bool(data.get("valid", np.all(np.isfinite(goal_arr)))),
                         "ee_goal_local_cart": goal_arr,
                         "gripper_cmd": gripper_cmd,
+                        "base_lin_vel": base_lin_vel,
+                        "ee_goal_quat_base": ee_goal_quat,
                         "t": float(data.get("t", time.time())),
                         "recv_t": time.time(),
                     }
