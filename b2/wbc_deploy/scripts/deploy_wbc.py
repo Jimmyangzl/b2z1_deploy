@@ -26,7 +26,8 @@ from unitree_sdk2py.utils.crc import CRC
 from unitree_sdk2py.utils.thread import RecurrentThread
 
 from state.leg_dof_mapping import motor_legs_to_sim, sim_legs_to_motor
-from commands.vel_keyboard import VelKeyboardController
+from commands.vel_keyboard import DeployHotkeys
+from control.dof_limits import clip_dof_pos, load_leg_arm_limit_arrays
 from control.gains import GainLike, as_gain_vector
 from control.incremental_ik import incremental_ik_step
 from safety.leg_shutdown import leg_joint_dict_to_array, run_leg_soft_shutdown
@@ -75,14 +76,21 @@ class B2LowCmdWriter:
         kp: GainLike,
         kd: GainLike,
         initial_targets_sim: Optional[np.ndarray] = None,
+        leg_lo: Optional[np.ndarray] = None,
+        leg_hi: Optional[np.ndarray] = None,
     ):
         # Store gains in B2 motor order (same indexing as motor_cmd[0:12]).
         self.kp = sim_legs_to_motor(as_gain_vector(kp, 12, "leg kp"))
         self.kd = sim_legs_to_motor(as_gain_vector(kd, 12, "leg kd"))
+        if leg_lo is None or leg_hi is None:
+            leg_lo, leg_hi, _, _ = load_leg_arm_limit_arrays()
+        self._leg_lo = np.asarray(leg_lo, dtype=np.float64).reshape(12)
+        self._leg_hi = np.asarray(leg_hi, dtype=np.float64).reshape(12)
         self.crc = CRC()
         self.low_cmd = unitree_go_msg_dds__LowCmd_()
         if initial_targets_sim is not None:
-            self._targets = sim_legs_to_motor(initial_targets_sim)
+            q0 = clip_dof_pos(initial_targets_sim, self._leg_lo, self._leg_hi)
+            self._targets = sim_legs_to_motor(q0)
         else:
             self._targets = np.zeros(12, dtype=np.float64)
         self._lock = threading.Lock()
@@ -118,9 +126,10 @@ class B2LowCmdWriter:
             self.kd = sim_legs_to_motor(as_gain_vector(kd, 12, "leg kd"))
 
     def set_leg_targets(self, q_targets_sim: np.ndarray) -> None:
-        """Accept leg targets in URDF/sim order; store in B2 motor order for lowcmd."""
+        """Accept leg targets in URDF/sim order; clamp then store in B2 motor order."""
+        q = clip_dof_pos(q_targets_sim, self._leg_lo, self._leg_hi)
         with self._lock:
-            self._targets = sim_legs_to_motor(q_targets_sim)
+            self._targets = sim_legs_to_motor(q)
 
     def get_leg_targets_sim(self) -> np.ndarray:
         """Current commanded leg targets in URDF/sim order."""
@@ -157,7 +166,8 @@ class Z1ArmWriter:
         control_dt: float = 0.02,
         home_interp_s: float = 2.0,
         control_mode: str = "tdes",
-        elbow_limit: Optional[tuple] = None,
+        arm_lo: Optional[np.ndarray] = None,
+        arm_hi: Optional[np.ndarray] = None,
         fsm_mode: str = "jointctrl",
         kp: GainLike = 20.0,
         kd: GainLike = 2000.0,
@@ -180,20 +190,22 @@ class Z1ArmWriter:
         self.kd = as_gain_vector(kd, 6, "arm kd")
         self.gripper_kp = float(gripper_kp)
         self.gripper_kd = float(gripper_kd)
-        if elbow_limit is None:
-            self._elbow_limit = (-2.0, 0.0)
-        else:
-            lo, hi = float(elbow_limit[0]), float(elbow_limit[1])
-            if lo > hi:
-                raise ValueError(f"elbow_limit lower > upper: {elbow_limit}")
-            self._elbow_limit = (lo, hi)
+        if arm_lo is None or arm_hi is None:
+            _, _, arm_lo, arm_hi = load_leg_arm_limit_arrays()
+        self._arm_lo = np.asarray(arm_lo, dtype=np.float64).reshape(6)
+        self._arm_hi = np.asarray(arm_hi, dtype=np.float64).reshape(6)
+        self.arm_home_joint = clip_dof_pos(self.arm_home_joint, self._arm_lo, self._arm_hi)
         self._arm = z1_reader.arm
         self._arm_model = z1_reader.arm_model
         self._ready = False
         self._qd_zero = np.zeros(6, dtype=np.float64)
         self._qdd_zero = np.zeros(6, dtype=np.float64)
         self._ftip_zero = np.zeros(6, dtype=np.float64)
-        self._gripper_pos = None
+        # Binary gripper command: closed=0, open=-1 (space toggles).
+        self.gripper_closed = 0.0
+        self.gripper_open = -1.0
+        self._gripper_pos = float(self.gripper_closed)
+        self._gripper_lock = threading.Lock()
         self._homing = False
         self._home_q_start = np.zeros(6, dtype=np.float64)
         self._home_alpha = 0.0
@@ -211,10 +223,25 @@ class Z1ArmWriter:
         }
 
     def _apply_joint_limits(self, q: np.ndarray) -> np.ndarray:
-        """Clip commanded joints (elbow index 2 → configured range)."""
-        q = np.asarray(q, dtype=np.float64).reshape(6).copy()
-        q[2] = float(np.clip(q[2], self._elbow_limit[0], self._elbow_limit[1]))
-        return q
+        """Clip commanded Z1 joints to hard_dof_pos_limit."""
+        return clip_dof_pos(q, self._arm_lo, self._arm_hi)
+
+    def toggle_gripper(self) -> float:
+        """Toggle commanded gripper between closed (0) and open (-1)."""
+        with self._gripper_lock:
+            if abs(self._gripper_pos - self.gripper_closed) < 1e-6:
+                self._gripper_pos = float(self.gripper_open)
+                state = "open"
+            else:
+                self._gripper_pos = float(self.gripper_closed)
+                state = "closed"
+            pos = float(self._gripper_pos)
+        print(f"[gripper] {state} ({pos:.1f})", flush=True)
+        return pos
+
+    def gripper_command(self) -> float:
+        with self._gripper_lock:
+            return float(self._gripper_pos)
 
     def set_gains(
         self,
@@ -283,11 +310,13 @@ class Z1ArmWriter:
         s = self._last_status
         has_ik = s.get("has_ik")
         ik_s = "?" if has_ik is None else str(bool(has_ik))
+        g = self.gripper_command()
+        g_s = "closed" if abs(g - self.gripper_closed) < 1e-6 else "open"
         return (
             f"fsm={self.fsm_mode} vr_connected={s.get('vr_connected')} "
             f"holding={s.get('holding')} "
             f"Tdes0={s.get('Tdes0_locked')} |Tdes|={s.get('tdes_trans_norm'):.3f} "
-            f"hasIK={ik_s} mode={s.get('mode')}"
+            f"hasIK={ik_s} mode={s.get('mode')} gripper={g_s}({g:.1f})"
         )
 
     def _goal_pose_arm_frame_wbc(self, robot, vr_goal) -> np.ndarray:
@@ -420,11 +449,9 @@ class Z1ArmWriter:
         obs_builder,
         phase_variable: float = 0.0,
     ) -> None:
-        del obs_builder
+        del obs_builder, gripper_q  # command comes from space-toggle latch
         if not self._ensure_ready():
             return
-        if self._gripper_pos is None:
-            self._gripper_pos = gripper_q
 
         q_meas = np.asarray(robot.arm_q, dtype=np.float64).reshape(6)
         if self._q_hold is None:
@@ -444,11 +471,21 @@ class Z1ArmWriter:
         self._arm.qd = qd_cmd
         self._arm.tau = tau_f
         self._arm.setArmCmd(_vec6(q_cmd), _vec6(qd_cmd), _vec6(tau_f))
-        self._arm.setGripperCmd(float(self._gripper_pos), 0.0, 0.0)
+        self._arm.setGripperCmd(self.gripper_command(), 0.0, 0.0)
 
-def leg_targets_from_action(action: np.ndarray, default_leg: np.ndarray, action_scale: list) -> np.ndarray:
+def leg_targets_from_action(
+    action: np.ndarray,
+    default_leg: np.ndarray,
+    action_scale: list,
+    *,
+    clip_actions: float = 20.0,
+) -> np.ndarray:
     scale = np.asarray(action_scale[:12], dtype=np.float64)
-    return default_leg[:12] + scale * action[:12]
+    act = np.asarray(action[:12], dtype=np.float64)
+    clip = float(clip_actions)
+    if clip > 0:
+        act = np.clip(act, -clip, clip)
+    return default_leg[:12] + scale * act
 
 
 def _sleep_dt(dt: float, shutdown: dict) -> None:
@@ -589,9 +626,8 @@ def _format_gains(label: str, kp: GainLike, kd: GainLike, n: int) -> str:
 
 
 def _make_z1_writer(args, aggregator, config, arm_home, dt, *, control_mode: str) -> Z1ArmWriter:
-    limits = config.get("arm_joint_limits") or {}
-    elbow = limits.get("elbow", [-2.0, 0.0])
     arm_cfg = config.get("arm_control") or {}
+    _, _, arm_lo, arm_hi = load_leg_arm_limit_arrays(config)
     # SDK LOWCMD defaults (Unitree command units).
     default_arm_kp = [20.0, 30.0, 30.0, 20.0, 15.0, 10.0]
     default_arm_kd = [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
@@ -608,7 +644,8 @@ def _make_z1_writer(args, aggregator, config, arm_home, dt, *, control_mode: str
         control_dt=dt,
         home_interp_s=float(config.get("arm_home_interp_s", 2.0)),
         control_mode=control_mode,
-        elbow_limit=(float(elbow[0]), float(elbow[1])),
+        arm_lo=arm_lo,
+        arm_hi=arm_hi,
         fsm_mode=str(arm_cfg.get("mode", "jointctrl")),
         kp=arm_cfg.get("kp", default_arm_kp),
         kd=arm_cfg.get("kd", default_arm_kd),
@@ -640,7 +677,7 @@ def main() -> None:
     parser.add_argument(
         "--vel_keyboard",
         action="store_true",
-        help="After policy starts, update cmd_vx/vy/yaw via keyboard (w/s/a/d/q/e/space)",
+        help="After policy starts, update cmd_vx/vy/yaw via keyboard (w/s/a/d/q/e; 0=stop)",
     )
     args = parser.parse_args()
 
@@ -684,15 +721,21 @@ def main() -> None:
 
     default_dof = obs_builder.default_dof_pos
     action_scale = config["control"]["action_scale"]
-    arm_home = np.array(
-        config.get("arm_init_joint", config["arm_home_joint"]),
-        dtype=np.float64,
+    clip_actions = float(config["control"].get("clip_actions", 20.0))
+    leg_lo, leg_hi, arm_lo, arm_hi = load_leg_arm_limit_arrays(config)
+    arm_home = clip_dof_pos(
+        np.array(
+            config.get("arm_init_joint", config["arm_home_joint"]),
+            dtype=np.float64,
+        ),
+        arm_lo,
+        arm_hi,
     )
-    q_init = init_deploy_joint_from_config(config)
+    q_init = clip_dof_pos(init_deploy_joint_from_config(config), leg_lo, leg_hi)
 
     lowcmd_writer = None
     z1_writer = None
-    vel_keyboard = None
+    hotkeys = None
     ee_goal_publisher = None
     # Dry run and arm-only: always evaluate policy for printing (legs not applied in arm-only).
     apply_policy = (not args.execute_actions) or args.arm_only
@@ -723,11 +766,23 @@ def main() -> None:
         ee_goal_publisher = EeGoalWsServer(host=ee_host, port=ee_port, rate_hz=ee_rate)
         ee_goal_publisher.start()
 
+    def _start_gripper_hotkeys() -> None:
+        nonlocal hotkeys
+        if hotkeys is not None or z1_writer is None:
+            return
+        hotkeys = DeployHotkeys(
+            config.get("keyboard_vel", {}),
+            enable_vel=False,
+            on_gripper_toggle=z1_writer.toggle_gripper,
+        )
+        hotkeys.start()
+
     if args.arm_only:
         print("Starting Z1 arm writer (teleop Tdes mode); sport mode untouched...")
         z1_writer = _make_z1_writer(
             args, aggregator, config, arm_home, dt, control_mode="tdes"
         )
+        _start_gripper_hotkeys()
         apply_policy = False  # never send policy leg targets
     elif args.execute_actions:
         print("Waiting for valid B2 lowstate before starting lowcmd...")
@@ -758,6 +813,8 @@ def main() -> None:
             kp=startup_kp,
             kd=startup_kd,
             initial_targets_sim=q_start,
+            leg_lo=leg_lo,
+            leg_hi=leg_hi,
         )
         time.sleep(0.1)
         if not args.no_release_mode:
@@ -768,6 +825,7 @@ def main() -> None:
             z1_writer = _make_z1_writer(
                 args, aggregator, config, arm_home, dt, control_mode="tdes"
             )
+            _start_gripper_hotkeys()
 
         apply_policy = run_init_deploy_sequence(
             config=config,
@@ -785,6 +843,7 @@ def main() -> None:
             ee_goal_publisher=ee_goal_publisher,
         )
 
+    # Enable velocity keys on the same stdin listener (space remains gripper-only).
     if args.vel_keyboard and apply_policy and not args.arm_only:
         obs_builder.use_cmd = True
         config.setdefault("commands", {})["use_cmd"] = True
@@ -792,21 +851,32 @@ def main() -> None:
         def _on_vel(vx: float, vy: float, yaw: float) -> None:
             obs_builder.set_commands(vx, vy, yaw)
 
-        vel_keyboard = VelKeyboardController(
-            config.get("keyboard_vel", {}),
-            on_update=_on_vel,
-        )
-        vel_keyboard.start()
+        if hotkeys is None:
+            hotkeys = DeployHotkeys(
+                config.get("keyboard_vel", {}),
+                enable_vel=True,
+                on_vel_update=_on_vel,
+                on_gripper_toggle=(
+                    z1_writer.toggle_gripper if z1_writer is not None else None
+                ),
+            )
+            hotkeys.start()
+        else:
+            hotkeys.set_velocity_enabled(True, on_vel_update=_on_vel)
     elif args.vel_keyboard and args.arm_only:
-        print("[vel_keyboard] skipped (--arm-only; no leg policy commands).")
+        print("[hotkeys] velocity skipped (--arm-only; no leg policy commands).")
     elif args.vel_keyboard and not apply_policy:
-        print("[vel_keyboard] skipped (policy output not confirmed).")
+        print("[hotkeys] velocity skipped (policy output not confirmed).")
 
     print("\nB2Z1 WBC deploy")
     print(f"  execute_actions: {args.execute_actions}")
     print(f"  arm_only       : {args.arm_only}")
     print(f"  apply_policy   : {apply_policy and not args.arm_only}")
-    print(f"  vel_keyboard   : {bool(vel_keyboard is not None)}")
+    print(
+        f"  hotkeys        : "
+        f"gripper={'on' if z1_writer is not None else 'off'} "
+        f"vel={'on' if (hotkeys is not None and hotkeys.enable_vel) else 'off'}"
+    )
     if args.execute_actions and not args.arm_only:
         print(f"  legs_only      : {args.legs_only}")
         print(
@@ -837,6 +907,10 @@ def main() -> None:
         print("  arm_control    : Tdes (T_goal = T_init @ inv(Tdes0) @ Tdes)")
     print(f"  checkpoint     : {args.checkpoint}")
     print(f"  rate           : {rate} Hz")
+    print(
+        "  hard_dof_limit : legs+arm clamped to control.hard_dof_pos_limit "
+        f"(elbow {arm_lo[2]:.2f}..{arm_hi[2]:.2f})"
+    )
     if args.no_vr:
         print("  VR server      : disabled (--no-vr); EE goal held at current pose")
     else:
@@ -864,7 +938,9 @@ def main() -> None:
             obs_builder.update_action_history(action)
 
             if apply_policy and not args.arm_only:
-                leg_q_target = leg_targets_from_action(action, default_dof, action_scale)
+                leg_q_target = leg_targets_from_action(
+                    action, default_dof, action_scale, clip_actions=clip_actions
+                )
             else:
                 leg_q_target = q_init
 
@@ -892,7 +968,7 @@ def main() -> None:
                 if z1_writer is not None:
                     print("  arm_cmd        : Tdes incremental IK → JOINTCTRL")
                     print(f"  arm_teleop     : {z1_writer.status_line()}")
-                if vel_keyboard is not None:
+                if hotkeys is not None and hotkeys.enable_vel:
                     print(
                         f"  keyboard_cmd   : "
                         f"vx={obs_builder.commands[0]:.2f} "
@@ -909,8 +985,8 @@ def main() -> None:
         shutdown["stop"] = True
         print("\nStopped.")
     finally:
-        if vel_keyboard is not None:
-            vel_keyboard.stop()
+        if hotkeys is not None:
+            hotkeys.stop()
         if z1_writer is not None:
             z1_writer.stop()
         if lowcmd_writer is not None:

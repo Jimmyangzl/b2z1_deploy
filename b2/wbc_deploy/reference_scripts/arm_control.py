@@ -81,20 +81,24 @@ class ArmController:
             dpos_xy_norm = torch.norm(dpos[:, :2], p=2, dim=1)
             self.phase_variable = 1.0 / (1 + torch.exp(-5 * (dpos_xy_norm - 1.0) / 1.0))
 
-        # dvel is used for RFM locomotion obs/rewards when use_cmd=False.
-        # Previously gated on fix_sample only, which left dvel=0 under base_sample.
-        need_dvel = (not self.cfg.experiment.use_cmd) and (
-            self.cfg.experiment.fix_sample
-            or bool(getattr(self.cfg.experiment, "base_sample", False))
-        )
-        if not need_dvel:
+        # dvel drives RFM locomotion obs/rewards whenever commands are not used.
+        if self.cfg.experiment.use_cmd:
             return
 
         dpos_b_world = env.curr_ee_goal_cart_world.clone() - env.base_pos.clone()
         self.dpos_b_local = quat_rotate_inverse(env.base_yaw_quat, dpos_b_world)
 
         dvel_b_local_norm = torch.norm(self.dpos_b_local[:, :2], p=2, dim=1, keepdim=True)
-        self.dvel_b_local[:, :2] = 0.2 * self.dpos_b_local[:, :2] / (dvel_b_local_norm[:, :2] + 1e-8)
+        amp = float(getattr(self.cfg.experiment, "dvel_xy_amp", 0.2))
+        # Larger amp for far goals (base_sample or yaw-frame base_sample_far_ratio).
+        if hasattr(env, "ee_goals") and hasattr(env.ee_goals, "base_sample_far"):
+            amp_far = float(getattr(self.cfg.experiment, "dvel_xy_amp_far", amp))
+            amp = torch.where(
+                env.ee_goals.base_sample_far,
+                torch.full((self.num_envs,), amp_far, device=self.device),
+                torch.full((self.num_envs,), amp, device=self.device),
+            ).unsqueeze(-1)
+        self.dvel_b_local[:, :2] = amp * self.dpos_b_local[:, :2] / (dvel_b_local_norm[:, :2] + 1e-8)
         self.dvel_b_local[:, 2] = 0.4 * env.manip.yaw_direction[:, 0]
 
         _, _, ee_goal_yaw = euler_from_quat(env.ee_goal_orn_quat)
@@ -104,8 +108,17 @@ class ArmController:
         )
         ee_euler_error = torch.abs(yaw_diff)
         # self.phase_variable = 0.3
+        # print(env.manip.manip_det_pred[:, -1])
+
+        if bool(getattr(self.cfg.experiment, "base_sample", False)):
+            arm_base_pos = env.base_pos + quat_apply(env.base_quat, env.arm_base_offset)
+        else:
+            arm_base_pos = env.base_pos + quat_apply(env.base_yaw_quat, env.arm_base_offset)
+        dist_base_ee = torch.norm(env.ee_pos[:, :2] - arm_base_pos[:, :2], p=2, dim=1)
+
         mask_xy = (
-            (env.manip.manip_det_pred[:, -1] > 0.0003) & (self.phase_variable < 0.5)
+            ((env.manip.manip_det_pred[:, -1] > 0.001) | (dist_base_ee < 0.7))
+            & (self.phase_variable < 0.5)
         ).unsqueeze(-1).expand_as(self.dvel_b_local[:, :2])
         mask_yaw = (
             # (env.manip.manip_det_pred[:, -1] < 0.001)
@@ -114,15 +127,11 @@ class ArmController:
             (ee_euler_error > 0.785)
         )
         # print(mask_yaw)
+        # print(env.manip.manip_det_pred[:, -1])
 
-        if bool(getattr(self.cfg.experiment, "base_sample", False)):
-            arm_base_pos = env.base_pos + quat_apply(env.base_quat, env.arm_base_offset)
-        else:
-            arm_base_pos = env.base_pos + quat_apply(env.base_yaw_quat, env.arm_base_offset)
-        dist_base_ee = torch.norm(env.ee_pos[:, :2] - arm_base_pos[:, :2], p=2, dim=1)
-
+        
         mask_back = (
-            (env.manip.manip_det_pred[:, -1] < 0.0003)
+            (env.manip.manip_det_pred[:, -1] < 0.0005)
             & (dist_base_ee < 0.4)
             & (self.phase_variable < 0.5)
         ).unsqueeze(-1).expand_as(self.dvel_b_local[:, :2])
@@ -131,6 +140,26 @@ class ArmController:
         self.dvel_b_local[:, :2] = torch.where(mask_xy, torch.zeros_like(self.dvel_b_local[:, :2]), self.dvel_b_local[:, :2])
         self.dvel_b_local[:, :2] = torch.where(mask_back, -self.dvel_b_local[:, :2], self.dvel_b_local[:, :2])
         self.dvel_b_local[:, 2] = torch.where(mask_yaw, self.dvel_b_local[:, 2], torch.zeros_like(self.dvel_b_local[:, 2]))
+
+        # Deadband: zero components below command clip thresholds.
+        x_clip = float(self.cfg.commands.lin_vel_x_clip)
+        y_clip = float(self.cfg.commands.lin_vel_y_clip)
+        yaw_clip = float(self.cfg.commands.ang_vel_yaw_clip)
+        self.dvel_b_local[:, 0] = torch.where(
+            torch.abs(self.dvel_b_local[:, 0]) < x_clip,
+            torch.zeros_like(self.dvel_b_local[:, 0]),
+            self.dvel_b_local[:, 0],
+        )
+        self.dvel_b_local[:, 1] = torch.where(
+            torch.abs(self.dvel_b_local[:, 1]) < y_clip,
+            torch.zeros_like(self.dvel_b_local[:, 1]),
+            self.dvel_b_local[:, 1],
+        )
+        self.dvel_b_local[:, 2] = torch.where(
+            torch.abs(self.dvel_b_local[:, 2]) < yaw_clip,
+            torch.zeros_like(self.dvel_b_local[:, 2]),
+            self.dvel_b_local[:, 2],
+        )
 
     def control_ik(self, dpose):
         env = self.env
@@ -170,8 +199,11 @@ class ArmController:
             if climb_mask.any():
                 arm_pos_targets[climb_mask] = env.default_dof_pos[arm_slice]
 
-        # z1_elbow (arm index 2): keep above URDF lower limit.
-        arm_pos_targets[:, 2] = torch.clamp(arm_pos_targets[:, 2], min=-3.0)
+        if getattr(env, "clamp_desired_dof_pos", False):
+            lim = env.hard_dof_pos_limits[arm_slice]
+            arm_pos_targets = torch.maximum(
+                torch.minimum(arm_pos_targets, lim[:, 1]), lim[:, 0],
+            )
 
         all_pos_targets = torch.zeros_like(env.dof_pos)
         all_pos_targets[:, arm_slice] = arm_pos_targets

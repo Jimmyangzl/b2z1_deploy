@@ -20,7 +20,30 @@ control:
   startup_kd: 10.0
   # Legs only (policy outputs 12); arm pose via IK on the robot.
   action_scale: [0.4, 0.45, 0.45, 0.4, 0.45, 0.45, 0.4, 0.45, 0.45, 0.4, 0.45, 0.45]
+  # Matches training normalization.clip_actions (was 100; now 20).
+  clip_actions: 20.0
   z1_command_freq_hz: 100
+  # Commanded joint clamps [rad] (sim order). Matches training hard_dof_pos_limit.
+  # Gripper omitted (held open/closed by teleop path, not policy).
+  hard_dof_pos_limit:
+    FL_hip_joint: [-0.2, 0.2]
+    FL_thigh_joint: [-0.94, 1.0]
+    FL_calf_joint: [-2.82, -1.0]
+    FR_hip_joint: [-0.2, 0.2]
+    FR_thigh_joint: [-0.94, 1.0]
+    FR_calf_joint: [-2.82, -1.0]
+    RL_hip_joint: [-0.2, 0.2]
+    RL_thigh_joint: [-0.94, 1.0]
+    RL_calf_joint: [-2.82, -1.0]
+    RR_hip_joint: [-0.2, 0.2]
+    RR_thigh_joint: [-0.94, 1.0]
+    RR_calf_joint: [-2.82, -1.0]
+    z1_waist: [-2.5, 2.5]
+    z1_shoulder: [0.0, 2.8]
+    z1_elbow: [-2.5, 0.0]
+    z1_wrist_angle: [-1.5, 1.5]
+    z1_forearm_roll: [-1.5, 1.5]
+    z1_wrist_rotate: [-2.5, 2.5]
 
 # Z1 arm PD (Unitree command units). Custom gains require mode: lowcmd.
 # jointctrl keeps the previous startTrack(JOINTCTRL) path and ignores kp/kd.
@@ -101,7 +124,8 @@ streaming:
 
 # WBC policy checkpoint (.pt). Optional if passed via --checkpoint on the CLI.
 policy:
-  checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy/model_48000.pt
+  checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy/model_25000.pt
+  # checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy/model_48000.pt
   # checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy/model_100000.pt
   # checkpoint: null
 
@@ -131,10 +155,21 @@ init_deploy_joint:
   # FR: [-0.16, 0.939, -1.52]
   # RL: [0.078,  0.58, -1.57]
   # RR: [0.0104,  0.6, -1.59]
-  FL: [-4.2240e-02,  8.7309e-01, -1.6837e+00]
-  FR: [-2.9564e-02,  6.6050e-01, -1.7029e+00]
-  RL: [7.5277e-02,  6.2199e-01, -1.6643e+00]
-  RR: [-3.0443e-01, 6.6166e-01, -1.6479e+00]
+  # FL: [-4.2240e-02,  8.7309e-01, -1.6837e+00]
+  # FR: [-2.9564e-02,  6.6050e-01, -1.7029e+00]
+  # RL: [7.5277e-02,  6.2199e-01, -1.6643e+00]
+  # RR: [-3.0443e-01, 6.6166e-01, -1.6479e+00]
+
+  # FL: [6.1352e-03,  7.3719e-01, -1.6395e+00]
+  # FR: [-7.9851e-03,  7.8602e-01, -1.6028e+00]
+  # RL: [-2.5622e-02,  7.2960e-01, -1.5496e+00]
+  # RR: [1.4613e-01,  8.4543e-01, -1.5455e+00]
+
+
+  FL: [-7.2982e-02,  6.2997e-01, -1.5102e+00]
+  FR: [-1.0239e-01,  6.2125e-01, -1.4149e+00]
+  RL: [5.7602e-03,  8.4863e-01, -1.5583e+00]
+  RR: [1.9368e-02,  7.4386e-01, -1.5605e+00]
 
   
 
@@ -171,9 +206,5 @@ shutdown_kp: 500.0
 # arm_init_joint: [0.0, 0.6, -0.6, 0.0, 0.0, 1.5707963267948966]
 # arm_init_joint: [0.0, 0.6, -0.6, 0.0, 0.0, 0.0]
 arm_init_joint: [0.0, 1.8, -0.9, -0.9, 0.0, 0.0]
-# Soft joint limits applied to Z1 commands in deploy (rad). Elbow = joint index 2.
-# SDK elbow range is ~[-2.89, 0]; we tighten lower bound for safety/workspace.
-arm_joint_limits:
-  elbow: [-2.8, 0.0]
 # Seconds to linearly interpolate joints toward arm_home when phase_variable > 0.5.
 arm_home_interp_s: 2.0

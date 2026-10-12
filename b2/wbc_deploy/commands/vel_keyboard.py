@@ -1,4 +1,4 @@
-"""Non-blocking keyboard base-velocity commands for WBC deploy."""
+"""Non-blocking terminal hotkeys for WBC deploy (velocity + gripper)."""
 
 from __future__ import annotations
 
@@ -10,20 +10,24 @@ import tty
 from typing import Callable, Optional
 
 
-class VelKeyboardController:
-    """Update base velocity commands from single-key presses (Linux tty).
+class DeployHotkeys:
+    """Single stdin listener for deploy keyboard controls (Linux tty).
 
-    Keys (defaults; magnitudes come from config ``keyboard_vel``):
-      w/s  → ±vx
-      a/d  → ±vy
-      q/e  → ±yaw
-      space → zero all
+    Keys:
+      space → toggle gripper (if ``on_gripper_toggle`` set)
+      w/s   → ±vx   (if velocity enabled)
+      a/d   → ±vy
+      q/e   → ±yaw
+      0     → zero vx/vy/yaw
     """
 
     def __init__(
         self,
-        keyboard_cfg: dict,
-        on_update: Optional[Callable[[float, float, float], None]] = None,
+        keyboard_cfg: Optional[dict] = None,
+        *,
+        enable_vel: bool = False,
+        on_vel_update: Optional[Callable[[float, float, float], None]] = None,
+        on_gripper_toggle: Optional[Callable[[], None]] = None,
     ):
         kb = keyboard_cfg or {}
         self.vx_fwd = float(kb.get("vx_fwd", 0.4))
@@ -32,29 +36,55 @@ class VelKeyboardController:
         self.vy_right = float(kb.get("vy_right", -0.3))
         self.yaw_left = float(kb.get("yaw_left", 0.3))
         self.yaw_right = float(kb.get("yaw_right", -0.3))
-        self.on_update = on_update
+        self.on_vel_update = on_vel_update
+        self.on_gripper_toggle = on_gripper_toggle
+        self.enable_vel = bool(enable_vel)
         self.vx = 0.0
         self.vy = 0.0
         self.yaw = 0.0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._old_term: Optional[list] = None
+        self._lock = threading.Lock()
+
+    def set_velocity_enabled(
+        self,
+        enabled: bool,
+        on_vel_update: Optional[Callable[[float, float, float], None]] = None,
+    ) -> None:
+        with self._lock:
+            self.enable_vel = bool(enabled)
+            if on_vel_update is not None:
+                self.on_vel_update = on_vel_update
+        if enabled:
+            print(
+                "[hotkeys] velocity: "
+                f"w/s vx=±{abs(self.vx_fwd):.2f}  "
+                f"a/d vy=±{abs(self.vy_left):.2f}  "
+                f"q/e yaw=±{abs(self.yaw_left):.2f}  "
+                "0=stop",
+                flush=True,
+            )
 
     def start(self) -> None:
         if self._thread is not None:
             return
         if not sys.stdin.isatty():
-            print("[vel_keyboard] stdin is not a TTY; keyboard control disabled.")
+            print("[hotkeys] stdin is not a TTY; keyboard control disabled.")
             return
-        self._thread = threading.Thread(target=self._loop, name="vel_keyboard", daemon=True)
+        self._thread = threading.Thread(target=self._loop, name="deploy_hotkeys", daemon=True)
         self._thread.start()
-        print(
-            "[vel_keyboard] active: "
-            f"w/s vx=±{abs(self.vx_fwd):.2f}  "
-            f"a/d vy=±{abs(self.vy_left):.2f}  "
-            f"q/e yaw=±{abs(self.yaw_left):.2f}  "
-            "space=stop"
-        )
+        parts = []
+        if self.on_gripper_toggle is not None:
+            parts.append("space=gripper toggle (closed=0 / open=-1)")
+        if self.enable_vel:
+            parts.append(
+                f"w/s vx=±{abs(self.vx_fwd):.2f}  "
+                f"a/d vy=±{abs(self.vy_left):.2f}  "
+                f"q/e yaw=±{abs(self.yaw_left):.2f}  "
+                "0=stop"
+            )
+        print(f"[hotkeys] active: {';  '.join(parts) if parts else 'none'}", flush=True)
 
     def stop(self) -> None:
         self._stop.set()
@@ -63,11 +93,21 @@ class VelKeyboardController:
             self._thread = None
         self._restore_terminal()
 
-    def _notify(self) -> None:
-        if self.on_update is not None:
-            self.on_update(self.vx, self.vy, self.yaw)
+    def _notify_vel(self) -> None:
+        cb = self.on_vel_update
+        if cb is not None:
+            cb(self.vx, self.vy, self.yaw)
 
     def _apply_key(self, ch: str) -> None:
+        if ch == " " and self.on_gripper_toggle is not None:
+            self.on_gripper_toggle()
+            return
+
+        with self._lock:
+            vel_on = self.enable_vel
+        if not vel_on:
+            return
+
         if ch in ("w", "W"):
             self.vx = self.vx_fwd
         elif ch in ("s", "S"):
@@ -80,17 +120,17 @@ class VelKeyboardController:
             self.yaw = self.yaw_left
         elif ch in ("e", "E"):
             self.yaw = self.yaw_right
-        elif ch == " ":
+        elif ch == "0":
             self.vx = 0.0
             self.vy = 0.0
             self.yaw = 0.0
         else:
             return
         print(
-            f"[vel_keyboard] cmd vx={self.vx:.2f} vy={self.vy:.2f} yaw={self.yaw:.2f}",
+            f"[hotkeys] cmd vx={self.vx:.2f} vy={self.vy:.2f} yaw={self.yaw:.2f}",
             flush=True,
         )
-        self._notify()
+        self._notify_vel()
 
     def _setup_terminal(self) -> None:
         fd = sys.stdin.fileno()
@@ -119,3 +159,20 @@ class VelKeyboardController:
                 self._apply_key(ch)
         finally:
             self._restore_terminal()
+
+
+# Back-compat alias used by older call sites / docs.
+class VelKeyboardController(DeployHotkeys):
+    """Velocity-focused hotkeys; prefer ``DeployHotkeys`` for new code."""
+
+    def __init__(
+        self,
+        keyboard_cfg: dict,
+        on_update: Optional[Callable[[float, float, float], None]] = None,
+    ):
+        super().__init__(
+            keyboard_cfg,
+            enable_vel=True,
+            on_vel_update=on_update,
+            on_gripper_toggle=None,
+        )

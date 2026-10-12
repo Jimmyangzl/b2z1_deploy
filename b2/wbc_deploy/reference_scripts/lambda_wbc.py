@@ -296,7 +296,7 @@ class lambdaWBC(LeggedRobot):
     def _build_proprio_obs(self, ee_goal_local_cart):
         grip = self.cfg.env.num_gripper_joints
         # ee_goal_local_cart = torch.tensor([0.6, 0., 0.48], device=self.device).repeat(self.num_envs, 1)
-        
+        # print(self.dvel_b_local)
         common = [
             self._get_body_orientation(),
             self.base_lin_vel * self.obs_scales.lin_vel,
@@ -1011,7 +1011,21 @@ class lambdaWBC(LeggedRobot):
                     raise Exception(f"PD gain of joint {name} were not defined, setting them to zero")
         # self.default_dof_pos = self.default_dof_pos.unsqueeze(0)
         self.default_dof_pos_wo_gripper = self.default_dof_pos[:-self.cfg.env.num_gripper_joints]
-        
+
+        # Hard clamps on desired joint positions (leg PD targets + arm IK targets).
+        hard_limit_cfg = getattr(self.cfg.control, "hard_dof_pos_limit", None)
+        self.clamp_desired_dof_pos = hard_limit_cfg is not None
+        self.hard_dof_pos_limits = torch.full(
+            (self.num_dofs, 2), float("inf"), dtype=torch.float, device=self.device, requires_grad=False,
+        )
+        self.hard_dof_pos_limits[:, 0] = float("-inf")
+        if self.clamp_desired_dof_pos:
+            for i, name in enumerate(self.dof_names):
+                if name in hard_limit_cfg:
+                    lo, hi = hard_limit_cfg[name]
+                    self.hard_dof_pos_limits[i, 0] = float(lo)
+                    self.hard_dof_pos_limits[i, 1] = float(hi)
+
         self.global_steps = 0
                 
 
@@ -1401,7 +1415,11 @@ class lambdaWBC(LeggedRobot):
         actions_scaled = actions * self.motor_strength * self.action_scale
         # actions_scaled[:, :12] = torch.tensor([
         #     0.02, -0.16, -0.002, 0.001, -0.137, -0.022,  0.032, -0.157, -0.018,  0.013, -0.124, -0.054], device=self.device).repeat(self.num_envs, 1)
-        default_torques = self.p_gains * (actions_scaled + self.default_dof_pos_wo_gripper - self.dof_pos_wo_gripper) - self.d_gains * self.dof_vel_wo_gripper
+        q_des = actions_scaled + self.default_dof_pos_wo_gripper
+        if self.clamp_desired_dof_pos:
+            lim = self.hard_dof_pos_limits[: self.num_torques]
+            q_des = torch.maximum(torch.minimum(q_des, lim[:, 1]), lim[:, 0])
+        default_torques = self.p_gains * (q_des - self.dof_pos_wo_gripper) - self.d_gains * self.dof_vel_wo_gripper
         default_torques[:, -6:] = 0
         torques = torch.cat([default_torques, self.gripper_torques_zero], dim=-1)
 

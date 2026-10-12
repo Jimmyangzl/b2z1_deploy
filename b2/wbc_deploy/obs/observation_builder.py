@@ -125,10 +125,12 @@ class ObservationBuilder:
           xy = dvel_xy_amp * unit(goal in base_yaw xy)
           yaw = dvel_yaw_amp * sign(goal_yaw - base_yaw)
         masks (same as arm_control.update_rfm_state):
-          mask_xy:   manip_pred > 3e-4 and phase < 0.5  → zero xy
-          mask_back: manip_pred < 3e-4 and dist(ee, mount)_xy < 0.4 and phase < 0.5
+          mask_xy:   (manip_pred > 1e-3 or dist(ee, mount)_xy < 0.7) and phase < 0.5
+                     → zero xy
+          mask_back: manip_pred < 5e-4 and dist(ee, mount)_xy < 0.4 and phase < 0.5
                      → flip xy
           mask_yaw:  |yaw_err| > 0.785  → keep yaw; else zero yaw
+          deadband:  |dvel_i| < commands.*_clip → zero that component
         """
         goal_pos = vr_goal.get_goal_position(robot.ee_pos)  # robot base frame
         base_quat = np.asarray(robot.base_quat, dtype=np.float64)
@@ -165,13 +167,14 @@ class ObservationBuilder:
         self.dvel_b_local[2] = self.dvel_yaw_amp * yaw_direction
         ee_euler_error = abs(yaw_diff)
 
-        mask_xy = (manip_pred_last > 0.0003) and (self.phase_variable < 0.5)
-        mask_yaw = ee_euler_error > 0.785
-
         arm_mount_yaw = self._base_to_base_yaw_pos(self.policy_arm_base_offset, base_quat)
         dist_base_ee = float(np.linalg.norm((ee_yaw - arm_mount_yaw)[:2]))
+        mask_xy = (
+            (manip_pred_last > 0.001) or (dist_base_ee < 0.7)
+        ) and (self.phase_variable < 0.5)
+        mask_yaw = ee_euler_error > 0.785
         mask_back = (
-            (manip_pred_last < 0.0003)
+            (manip_pred_last < 0.0005)
             and (dist_base_ee < 0.4)
             and (self.phase_variable < 0.5)
         )
@@ -181,6 +184,14 @@ class ObservationBuilder:
         if mask_back:
             self.dvel_b_local[:2] = -self.dvel_b_local[:2]
         if not mask_yaw:
+            self.dvel_b_local[2] = 0.0
+
+        # Deadband: zero components below command clip thresholds (matches arm_control).
+        if abs(self.dvel_b_local[0]) < self.lin_vel_x_clip:
+            self.dvel_b_local[0] = 0.0
+        if abs(self.dvel_b_local[1]) < self.lin_vel_y_clip:
+            self.dvel_b_local[1] = 0.0
+        if abs(self.dvel_b_local[2]) < self.ang_vel_yaw_clip:
             self.dvel_b_local[2] = 0.0
 
         if not vr_goal.is_active:
