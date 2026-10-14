@@ -56,7 +56,7 @@ class EeGoalWsServer:
         """Store latest EE goal, Z1 gripper command, and base linear velocity.
 
         ``gripper_cmd`` is the latched position sent to ``setGripperCmd``
-        (closed=0.2, open=-1). ``base_lin_vel`` is the same 3-vector printed
+        (closed=0, open=-1). ``base_lin_vel`` is the same 3-vector printed
         as ``base_lin_vel`` in the WBC observation summary.
         ``ee_goal_quat_base`` is the EE target orientation, wxyz, in the robot
         base frame. ``None`` means that field is unavailable.

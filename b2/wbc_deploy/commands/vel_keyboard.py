@@ -77,7 +77,7 @@ class DeployHotkeys:
         self._thread.start()
         parts = []
         if self.on_gripper_toggle is not None:
-            parts.append("space=gripper toggle (closed=0.2 / open=-1)")
+            parts.append("space=gripper toggle (closed=0 / open=-1)")
         if self.enable_vel:
             parts.append(
                 f"w/s vx=±{abs(self.vx_fwd):.2f}  "
