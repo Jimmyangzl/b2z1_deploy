@@ -3,7 +3,8 @@
 Records synchronized sessions to HDF5 on the **recording laptop**:
 
 - RGB from Intel RealSense D435i → `(N, 480, 640, 3)` uint8
-- `ee_goal_local_cart` from WBC WebSocket publisher
+- `ee_goal_local_cart` / `ee_goal_quat_base` = arm IK target pose in **arm-base**
+  (`T_goal` from `deploy_wbc` tdes/wbc control), via WBC WebSocket
 - B2 `base_quat` + `base_lin_vel_local` via DDS on the robot Ethernet
 
 ## Topology
@@ -73,8 +74,8 @@ python scripts/record_session.py --task task_1 --no-b2 --no-ee --rate 20
 |---------|-------|-------|
 | `timestamp` | `(N,)` | Recorder wall time (s) |
 | `rgb` | `(N, 480, 640, 3)` | RGB uint8 |
-| `ee_goal_local_cart` | `(N, 3)` | Arm-base position. NaN if stale/missing |
-| `ee_goal_quat_base` | `(N, 4)` | EE target quaternion, wxyz, robot base frame. NaN if stale/missing |
+| `ee_goal_local_cart` | `(N, 3)` | IK EE goal position in arm-base (`T_goal`). NaN if stale/missing |
+| `ee_goal_quat_base` | `(N, 4)` | IK EE goal orientation, wxyz, arm-base frame. NaN if stale/missing |
 | `ee_pos` | `(N, 3)` | Measured EE position, arm-base frame. NaN if arm disconnected or stale |
 | `ee_quat` | `(N, 4)` | Measured EE orientation, wxyz, arm-base frame. NaN if arm disconnected or stale |
 | `ee_goal_age_s` | `(N,)` | Age of EE sample vs wall time |
@@ -86,10 +87,11 @@ File attrs: `record_rate_hz`, `ee_ws_url`, `interface`, `camera_serial`, `create
 
 ## Relative trajectory transform
 
-Converts each recorded frame into a horizon of poses expressed in the **arm-base
-mount frame at time `t`**. Base motion is recovered by integrating
-`base_lin_vel_local * dt` (`dt = 1 / record_rate_hz`) with `base_quat` rotations.
-Past the episode end, the last relative pose is repeated (stationary pad).
+Converts each recorded frame into a horizon of goal poses expressed in the
+**observed EE frame at time `t`** (`ee_pos`, `ee_quat` in the arm-base frame).
+Base motion is recovered by integrating `base_lin_vel_local * dt`
+(`dt = 1 / record_rate_hz`) with `base_quat` rotations. Past the episode end,
+the last relative pose is repeated (stationary pad).
 
 ```bash
 cd ~/unitree_deploy/b2z1_deploy/data_record
@@ -104,23 +106,24 @@ python scripts/make_relative_traj.py --task test --chunk-n 20 --arm-offset 0.15 
 ```
 
 Writes `recordings/relative_traj/<task>/episode_*.h5` (overwrites if present).
-Episodes with any NaN in `ee_goal_local_cart`, `ee_goal_quat_base`,
-`base_lin_vel_local`, `base_quat`, or `gripper_cmd` are reported and skipped.
+Episodes with any NaN in `ee_goal_local_cart`, `ee_goal_quat_base`, `ee_pos`,
+`ee_quat`, `base_lin_vel_local`, `base_quat`, or `gripper_cmd` are reported and
+skipped.
 
 | Dataset | Shape | Notes |
 |---------|-------|-------|
 | `timestamp` | `(T,)` | Copied from source |
 | `rgb` | `(T, H, W, 3)` | Copied unchanged |
-| `ee_goal_cart_chunk` | `(T, n, 3)` | EE goal in arm-base frame at `t` |
-| `ee_goal_quat_chunk` | `(T, n, 4)` | EE quat wxyz in arm-base frame at `t` |
+| `ee_goal_cart_chunk` | `(T, n, 3)` | EE goal in observed-EE frame at `t` |
+| `ee_goal_quat_chunk` | `(T, n, 4)` | EE quat wxyz in observed-EE frame at `t` |
 | `gripper_cmd` | `(T, n)` | Sliced/padded gripper command |
 
 Extra attrs: `chunk_n`, `dt`, `arm_base_offset`, `source_path`, `relative_traj`.
 
 ### Visualize a relative episode
 
-Interactive matplotlib UI: RGB | 3D EE chunk in `F_t` (arm-base axes at origin,
-orientation frames, markers colored by `gripper_cmd`). Slider scrubs `t`.
+Interactive matplotlib UI: RGB | 3D EE chunk in `F_t` (observed-EE axes at
+origin, orientation frames, markers colored by `gripper_cmd`). Slider scrubs `t`.
 
 ```bash
 cd ~/unitree_deploy/b2z1_deploy/data_record

@@ -1,9 +1,10 @@
-"""Convert recorded episodes into arm-base-relative trajectory chunks.
+"""Convert recorded episodes into EE-relative trajectory chunks.
 
-For each start index ``t`` and horizon ``n``, poses in ``[t, t+n)`` are expressed
-in the arm-base mount frame at time ``t``. Base motion is recovered by integrating
-``base_lin_vel_local * dt`` with ``dt = 1 / record_rate_hz``, rotating each step
-into ``F_t`` via ``base_quat``.
+For each start index ``t`` and horizon ``n``, goal poses in ``[t, t+n)`` are
+expressed in the **observed EE frame** at time ``t`` (from ``ee_pos``,
+``ee_quat``). Base motion is recovered by integrating
+``base_lin_vel_local * dt`` with ``dt = 1 / record_rate_hz``, rotating each
+step into a temporary world frame via ``base_quat``.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ DEFAULT_ARM_BASE_OFFSET = np.array([0.15, 0.0, 0.10], dtype=np.float64)
 _NAN_GATE_FIELDS = (
     "ee_goal_local_cart",
     "ee_goal_quat_base",
+    "ee_pos",
+    "ee_quat",
     "base_lin_vel_local",
     "base_quat",
     "gripper_cmd",
@@ -75,6 +78,9 @@ def report_nan_fields(data: Dict[str, np.ndarray]) -> List[str]:
     """Return human-readable NaN reports for gated fields. Empty ⇒ clean."""
     reports: List[str] = []
     for name in _NAN_GATE_FIELDS:
+        if name not in data:
+            reports.append(f"{name}: missing from episode")
+            continue
         arr = np.asarray(data[name])
         bad = ~np.isfinite(arr)
         if not bad.any():
@@ -113,6 +119,8 @@ def compute_relative_chunks(
     *,
     ee_goal_local_cart: np.ndarray,
     ee_goal_quat_base: np.ndarray,
+    ee_pos: np.ndarray,
+    ee_quat: np.ndarray,
     base_lin_vel_local: np.ndarray,
     base_quat: np.ndarray,
     gripper_cmd: np.ndarray,
@@ -122,19 +130,22 @@ def compute_relative_chunks(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Build ``(T, n, …)`` relative EE cart/quat chunks and gripper slices.
 
-    Frame ``F_t`` is the arm-base mount at time ``t`` (same orientation as the
-    robot base; origin shifted by ``arm_base_offset`` in the body frame).
+    Frame ``F_t`` is the **observed EE pose** at time ``t`` (``ee_pos``,
+    ``ee_quat`` in the arm-base frame). Goal poses are transformed into ``F_t``
+    after accounting for base motion between ``t`` and each horizon index.
 
     Past the episode end, each horizon step repeats the last relative pose
     (base treated as stationary in the world).
     """
-    ee_local = np.asarray(ee_goal_local_cart, dtype=np.float64)
-    ee_quat = np.asarray(ee_goal_quat_base, dtype=np.float64)
+    ee_goal_pos = np.asarray(ee_goal_local_cart, dtype=np.float64)
+    ee_goal_q = np.asarray(ee_goal_quat_base, dtype=np.float64)
+    obs_pos = np.asarray(ee_pos, dtype=np.float64)
+    obs_q = np.asarray(ee_quat, dtype=np.float64)
     vel = np.asarray(base_lin_vel_local, dtype=np.float64)
     quat = np.asarray(base_quat, dtype=np.float64)
     grip = np.asarray(gripper_cmd, dtype=np.float64).reshape(-1)
 
-    t_len = ee_local.shape[0]
+    t_len = ee_goal_pos.shape[0]
     n = int(chunk_n)
     if n < 1:
         raise ValueError(f"chunk_n must be >= 1, got {n}")
@@ -149,8 +160,12 @@ def compute_relative_chunks(
     grip_chunk = np.empty((t_len, n), dtype=np.float64)
 
     for t in range(t_len):
-        q_t = quat[t]
-        p_arm_t = p_world[t] + quat_rotate(q_t, offset)
+        q_base_t = quat[t]
+        # Observed EE at t in the temporary world frame.
+        p_obs_w = p_world[t] + quat_rotate(q_base_t, obs_pos[t] + offset)
+        q_obs_w = quat_mul(q_base_t, obs_q[t])
+        q_obs_w_inv = quat_conjugate(q_obs_w)
+
         last_cart = np.full(3, np.nan)
         last_quat = np.full(4, np.nan)
         last_grip = np.nan
@@ -163,10 +178,11 @@ def compute_relative_chunks(
                 grip_chunk[t, k] = last_grip
                 continue
 
-            ee_world = p_world[i] + quat_rotate(quat[i], ee_local[i] + offset)
-            ee_rel = quat_rotate_inverse(q_t, ee_world - p_arm_t)
-            q_ee_rel = quat_mul(quat_conjugate(q_t), quat_mul(quat[i], ee_quat[i]))
-            # Keep unit length for numerical drift from mul chain.
+            p_goal_w = p_world[i] + quat_rotate(quat[i], ee_goal_pos[i] + offset)
+            q_goal_w = quat_mul(quat[i], ee_goal_q[i])
+
+            ee_rel = quat_rotate_inverse(q_obs_w, p_goal_w - p_obs_w)
+            q_ee_rel = quat_mul(q_obs_w_inv, q_goal_w)
             q_norm = np.linalg.norm(q_ee_rel)
             if q_norm > 0.0:
                 q_ee_rel = q_ee_rel / q_norm
@@ -207,6 +223,8 @@ def transform_episode_arrays(
     cart, quat, grip = compute_relative_chunks(
         ee_goal_local_cart=data["ee_goal_local_cart"],
         ee_goal_quat_base=data["ee_goal_quat_base"],
+        ee_pos=data["ee_pos"],
+        ee_quat=data["ee_quat"],
         base_lin_vel_local=data["base_lin_vel_local"],
         base_quat=data["base_quat"],
         gripper_cmd=data["gripper_cmd"],

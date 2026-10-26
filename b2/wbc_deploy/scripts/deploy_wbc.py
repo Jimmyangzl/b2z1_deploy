@@ -31,21 +31,28 @@ from control.dof_limits import clip_dof_pos, load_leg_arm_limit_arrays
 from control.gains import GainLike, as_gain_vector
 from control.incremental_ik import incremental_ik_step
 from safety.leg_shutdown import leg_joint_dict_to_array, run_leg_soft_shutdown
-from utils.math_utils import pos_quat_to_homogeneous
+from utils.math_utils import pos_quat_to_homogeneous, rotmat_to_quaternion
 from wbc_runtime import build_arg_parser, load_runtime, print_obs_summary, run_policy
 
 
-def _maybe_publish_ee(publisher, obs_pack: dict, gripper_cmd=None) -> None:
+def _maybe_publish_ee(publisher, obs_pack: dict, gripper_cmd=None, z1_writer=None) -> None:
+    """Publish recorder stream. EE goal prefers the arm IK target (arm-base)."""
     if publisher is None:
         return
     goal = obs_pack.get("ee_goal_local_cart")
+    goal_quat = obs_pack.get("ee_goal_quat_base")
+    if z1_writer is not None:
+        ik_pos, ik_quat = z1_writer.ee_goal_arm_pose()
+        if ik_pos is not None:
+            goal = ik_pos
+            goal_quat = ik_quat
     if goal is None:
         return
     publisher.update(
         goal,
         gripper_cmd=gripper_cmd,
         base_lin_vel=obs_pack.get("base_lin_vel"),
-        ee_goal_quat_base=obs_pack.get("ee_goal_quat_base"),
+        ee_goal_quat_base=goal_quat,
         ee_pos=obs_pack.get("ee_pos"),
         ee_quat=obs_pack.get("ee_quat"),
     )
@@ -219,6 +226,8 @@ class Z1ArmWriter:
         self._q_hold = None
         self._T_init: Optional[np.ndarray] = None
         self._Tdes0: Optional[np.ndarray] = None
+        # Last EE goal pose used for IK, in arm-base / FK frame (4x4).
+        self._last_T_goal: Optional[np.ndarray] = None
         self._last_status: dict = {
             "vr_connected": False,
             "holding": False,
@@ -249,6 +258,21 @@ class Z1ArmWriter:
     def gripper_command(self) -> float:
         with self._gripper_lock:
             return float(self._gripper_pos)
+
+    def _store_T_goal(self, T_goal: np.ndarray) -> None:
+        self._last_T_goal = np.asarray(T_goal, dtype=np.float64).reshape(4, 4).copy()
+
+    def ee_goal_arm_pose(self):
+        """Return ``(pos, quat_wxyz)`` of the last IK EE goal in arm-base, or ``(None, None)``."""
+        if self._last_T_goal is None:
+            return None, None
+        T = self._last_T_goal
+        pos = np.asarray(T[:3, 3], dtype=np.float64).copy()
+        quat = rotmat_to_quaternion(np.asarray(T[:3, :3], dtype=np.float64))
+        n = float(np.linalg.norm(quat))
+        if n > 0.0:
+            quat = quat / n
+        return pos, quat
 
     def set_gains(
         self,
@@ -417,6 +441,7 @@ class Z1ArmWriter:
 
         T_rel = np.linalg.inv(self._Tdes0) @ Tdes
         T_goal = T_init @ T_rel
+        self._store_T_goal(T_goal)
         q_ik = self._solve_ik_incremental(T_goal, q_meas)
         if q_ik is None:
             self._last_status["mode"] = "hold_ik_fail"
@@ -443,6 +468,7 @@ class Z1ArmWriter:
         self._homing = False
         self._home_alpha = 0.0
         T_goal = self._goal_pose_arm_frame_wbc(robot, vr_goal)
+        self._store_T_goal(T_goal)
         q_ik = self._solve_ik(T_goal, q_meas)
         if q_ik is None:
             return self._q_hold if self._q_hold is not None else q_meas.copy()
@@ -464,6 +490,7 @@ class Z1ArmWriter:
         if self._q_hold is None:
             self._q_hold = q_meas.copy()
 
+        t_goal_before = self._last_T_goal
         if self.control_mode == "tdes":
             q_cmd = self._cmd_from_tdes(vr_goal, q_meas)
         else:
@@ -471,6 +498,14 @@ class Z1ArmWriter:
 
         q_cmd = self._apply_joint_limits(q_cmd)
         self._q_hold = q_cmd.copy()
+        # If this step did not compute a new T_goal (hold / homing), use FK of q_cmd.
+        if self._last_T_goal is t_goal_before or self._last_T_goal is None:
+            self._store_T_goal(
+                np.asarray(
+                    self._arm_model.forwardKinematics(q_cmd, 6),
+                    dtype=np.float64,
+                ).reshape(4, 4)
+            )
         qd_cmd = self._qd_zero
         tau_f = self._arm_model.inverseDynamics(q_cmd, qd_cmd, self._qdd_zero, self._ftip_zero)
         # Match teleop_z1_vive_ws / z1_robot_prep: assign arm.q/qd/tau then setArmCmd.
@@ -545,11 +580,6 @@ def run_init_deploy_sequence(
         robot = aggregator.read()
         if robot.valid:
             obs_pack = obs_builder.build(robot, vr_goal)
-            _maybe_publish_ee(
-                ee_goal_publisher,
-                obs_pack,
-                None if z1_writer is None else z1_writer.gripper_command(),
-            )
             action = run_policy(policy, obs_pack["obs_vector"])
             obs_builder.update_action_history(action)
             if z1_writer is not None:
@@ -560,6 +590,12 @@ def run_init_deploy_sequence(
                     obs_builder=obs_builder,
                     phase_variable=obs_pack["phase_variable"],
                 )
+            _maybe_publish_ee(
+                ee_goal_publisher,
+                obs_pack,
+                None if z1_writer is None else z1_writer.gripper_command(),
+                z1_writer=z1_writer,
+            )
             if i % print_every == 0 or i == ramp_steps - 1:
                 print(f"\n=== init ramp {i + 1}/{ramp_steps} (alpha={alpha:.2f}) ===")
                 print_obs_summary(i, obs_pack, action, use_cmd=use_cmd)
@@ -580,11 +616,6 @@ def run_init_deploy_sequence(
         robot = aggregator.read()
         if robot.valid:
             obs_pack = obs_builder.build(robot, vr_goal)
-            _maybe_publish_ee(
-                ee_goal_publisher,
-                obs_pack,
-                None if z1_writer is None else z1_writer.gripper_command(),
-            )
             action = run_policy(policy, obs_pack["obs_vector"])
             obs_builder.update_action_history(action)
             if z1_writer is not None:
@@ -595,6 +626,12 @@ def run_init_deploy_sequence(
                     obs_builder=obs_builder,
                     phase_variable=obs_pack["phase_variable"],
                 )
+            _maybe_publish_ee(
+                ee_goal_publisher,
+                obs_pack,
+                None if z1_writer is None else z1_writer.gripper_command(),
+                z1_writer=z1_writer,
+            )
             if i % print_every == 0 or i == hold_steps - 1:
                 print(f"\n=== init hold {i + 1}/{hold_steps} ===")
                 print_obs_summary(i, obs_pack, action, use_cmd=use_cmd)
@@ -958,11 +995,6 @@ def main() -> None:
                 continue
 
             obs_pack = obs_builder.build(robot, vr_goal)
-            _maybe_publish_ee(
-                ee_goal_publisher,
-                obs_pack,
-                None if z1_writer is None else z1_writer.gripper_command(),
-            )
             action = run_policy(policy, obs_pack["obs_vector"])
             obs_builder.update_action_history(action)
 
@@ -982,6 +1014,13 @@ def main() -> None:
                     obs_builder=obs_builder,
                     phase_variable=obs_pack["phase_variable"],
                 )
+            # Publish after send so ee_goal_* match the IK T_goal (arm-base).
+            _maybe_publish_ee(
+                ee_goal_publisher,
+                obs_pack,
+                None if z1_writer is None else z1_writer.gripper_command(),
+                z1_writer=z1_writer,
+            )
 
             if args.verbose or step % max(1, int(rate)) == 0:
                 print_obs_summary(

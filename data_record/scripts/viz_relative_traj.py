@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Interactive visualizer for relative-trajectory HDF5 episodes.
 
-Side-by-side RGB + 3D EE chunk in arm-base frame ``F_t``, with a slider over ``t``.
+Side-by-side RGB + 3D EE chunk in observed-EE frame ``F_t``, with a slider over ``t``.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ def _parse_args() -> argparse.Namespace:
         "--frame-scale",
         type=float,
         default=0.02,
-        help="Orientation / arm-base axis length in meters (default: 0.02)",
+        help="Orientation / observed-EE axis length in meters (default: 0.02)",
     )
     p.add_argument(
         "--t0",
@@ -93,12 +93,12 @@ def _draw_frame(ax, origin: np.ndarray, q: np.ndarray, scale: float, alpha: floa
         )
 
 
-def _draw_arm_base_axes(ax, scale: float):
-    """RGB = XYZ at F_t origin."""
+def _draw_obs_ee_axes(ax, scale: float):
+    """RGB = XYZ at observed-EE frame F_t origin."""
     origin = np.zeros(3)
     identity = np.array([1.0, 0.0, 0.0, 0.0])
     _draw_frame(ax, origin, identity, scale, alpha=1.0)
-    ax.scatter([0], [0], [0], c="k", s=30, depthshade=False, label="arm-base F_t")
+    ax.scatter([0], [0], [0], c="k", s=30, depthshade=False, label="obs EE F_t")
 
 
 def main() -> int:
@@ -145,7 +145,7 @@ def main() -> int:
     pts_f = pts[finite]
     lo = pts_f.min(axis=0)
     hi = pts_f.max(axis=0)
-    # Include origin (arm-base) and frame tips roughly.
+    # Include origin (observed EE at t) and frame tips roughly.
     lo = np.minimum(lo, -scale)
     hi = np.maximum(hi, scale)
     center = 0.5 * (lo + hi)
@@ -211,7 +211,7 @@ def main() -> int:
         )
 
         ax_3d.cla()
-        _draw_arm_base_axes(ax_3d, scale)
+        _draw_obs_ee_axes(ax_3d, scale)
 
         pos = cart[t]  # (n, 3)
         g = grip[t]
@@ -236,7 +236,7 @@ def main() -> int:
         ax_3d.set_ylabel("y (m)")
         ax_3d.set_zlabel("z (m)")
         ax_3d.set_title(
-            f"EE chunk in arm-base F_t  |  offset={arm_off.tolist()}  |  "
+            f"EE goal chunk in obs-EE F_t  |  offset={arm_off.tolist()}  |  "
             f"frame_scale={scale:.3f}m"
         )
         _set_equal_box()

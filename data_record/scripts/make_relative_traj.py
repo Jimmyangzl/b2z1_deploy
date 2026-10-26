@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert recorded episode_*.h5 files into relative-trajectory chunks.
+"""Convert recorded episode_*.h5 files into observed-EE-relative trajectory chunks.
 
 Output layout under ``recordings/relative_traj/<task>/``:
 
@@ -39,7 +39,7 @@ _EPISODE_RE = re.compile(r"^episode_(\d+)\.h5$")
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Build arm-base-relative trajectory chunks from recorded HDF5."
+        description="Build observed-EE-relative trajectory chunks from recorded HDF5."
     )
     p.add_argument(
         "--task",
@@ -98,6 +98,8 @@ def _load_episode(path: str) -> Tuple[Dict, dict]:
             "rgb": f["rgb"][:],
             "ee_goal_local_cart": f["ee_goal_local_cart"][:],
             "ee_goal_quat_base": f["ee_goal_quat_base"][:],
+            "ee_pos": f["ee_pos"][:],
+            "ee_quat": f["ee_quat"][:],
             "base_lin_vel_local": f["base_lin_vel_local"][:],
             "base_quat": f["base_quat"][:],
             "gripper_cmd": f["gripper_cmd"][:],

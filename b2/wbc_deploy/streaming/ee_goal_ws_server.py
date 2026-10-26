@@ -62,9 +62,9 @@ class EeGoalWsServer:
         ``gripper_cmd`` is the latched position sent to ``setGripperCmd``
         (closed=0, open=-1). ``base_lin_vel`` is the same 3-vector printed
         as ``base_lin_vel`` in the WBC observation summary.
-        ``ee_goal_quat_base`` is the EE target orientation, wxyz, in the robot
-        base frame. ``ee_pos`` and ``ee_quat`` are the measured EE pose in the
-        arm-base frame (wxyz). ``None`` means that field is unavailable.
+        ``ee_goal_local_cart`` / ``ee_goal_quat_base`` are the IK EE target pose
+        in the arm-base frame (quat wxyz). ``ee_pos`` / ``ee_quat`` are the
+        measured EE pose in the same frame. ``None`` means unavailable.
         """
         goal = np.asarray(ee_goal_local_cart, dtype=np.float64).reshape(3)
         if gripper_cmd is None:
