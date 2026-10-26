@@ -29,6 +29,8 @@ class EeGoalWsClient:
             "gripper_cmd": float("nan"),
             "base_lin_vel": None,
             "ee_goal_quat_base": None,
+            "ee_pos": None,
+            "ee_quat": None,
             "t": 0.0,
             "recv_t": 0.0,
         }
@@ -66,6 +68,10 @@ class EeGoalWsClient:
                 out["ee_goal_quat_base"] = np.asarray(
                     out["ee_goal_quat_base"], dtype=np.float64
                 ).copy()
+            if out.get("ee_pos") is not None:
+                out["ee_pos"] = np.asarray(out["ee_pos"], dtype=np.float64).copy()
+            if out.get("ee_quat") is not None:
+                out["ee_quat"] = np.asarray(out["ee_quat"], dtype=np.float64).copy()
             return out
 
     def _set_latest(self, payload: dict) -> None:
@@ -85,6 +91,8 @@ class EeGoalWsClient:
                         "gripper_cmd": float("nan"),
                         "base_lin_vel": None,
                         "ee_goal_quat_base": None,
+                        "ee_pos": None,
+                        "ee_quat": None,
                         "t": 0.0,
                         "recv_t": time.time(),
                     }
@@ -120,6 +128,18 @@ class EeGoalWsClient:
                     if raw_quat is None
                     else np.asarray(raw_quat, dtype=np.float64).reshape(4)
                 )
+                raw_ee_pos = data.get("ee_pos")
+                ee_pos = (
+                    None
+                    if raw_ee_pos is None
+                    else np.asarray(raw_ee_pos, dtype=np.float64).reshape(3)
+                )
+                raw_ee_quat = data.get("ee_quat")
+                ee_quat_meas = (
+                    None
+                    if raw_ee_quat is None
+                    else np.asarray(raw_ee_quat, dtype=np.float64).reshape(4)
+                )
                 self._set_latest(
                     {
                         "valid": bool(data.get("valid", np.all(np.isfinite(goal_arr)))),
@@ -127,6 +147,8 @@ class EeGoalWsClient:
                         "gripper_cmd": gripper_cmd,
                         "base_lin_vel": base_lin_vel,
                         "ee_goal_quat_base": ee_goal_quat,
+                        "ee_pos": ee_pos,
+                        "ee_quat": ee_quat_meas,
                         "t": float(data.get("t", time.time())),
                         "recv_t": time.time(),
                     }

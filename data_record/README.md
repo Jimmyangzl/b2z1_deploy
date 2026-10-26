@@ -75,6 +75,8 @@ python scripts/record_session.py --task task_1 --no-b2 --no-ee --rate 20
 | `rgb` | `(N, 480, 640, 3)` | RGB uint8 |
 | `ee_goal_local_cart` | `(N, 3)` | Arm-base position. NaN if stale/missing |
 | `ee_goal_quat_base` | `(N, 4)` | EE target quaternion, wxyz, robot base frame. NaN if stale/missing |
+| `ee_pos` | `(N, 3)` | Measured EE position, arm-base frame. NaN if arm disconnected or stale |
+| `ee_quat` | `(N, 4)` | Measured EE orientation, wxyz, arm-base frame. NaN if arm disconnected or stale |
 | `ee_goal_age_s` | `(N,)` | Age of EE sample vs wall time |
 | `gripper_cmd` | `(N,)` | Z1 gripper command: `0.2` closed, `-1` open. NaN if missing/stale |
 | `base_lin_vel_local` | `(N, 3)` | WBC `base_lin_vel` (sport velocity in the base frame). NaN if that stream is stale |

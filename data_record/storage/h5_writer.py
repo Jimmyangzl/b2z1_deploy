@@ -96,6 +96,20 @@ class H5SessionWriter:
             dtype=np.float64,
             chunks=(chunk, 4),
         )
+        self._ee_pos = self._f.create_dataset(
+            "ee_pos",
+            shape=(0, 3),
+            maxshape=(None, 3),
+            dtype=np.float64,
+            chunks=(chunk, 3),
+        )
+        self._ee_quat_meas = self._f.create_dataset(
+            "ee_quat",
+            shape=(0, 4),
+            maxshape=(None, 4),
+            dtype=np.float64,
+            chunks=(chunk, 4),
+        )
 
     @property
     def num_frames(self) -> int:
@@ -112,6 +126,8 @@ class H5SessionWriter:
         base_quat: np.ndarray,
         gripper_cmd: float = float("nan"),
         ee_goal_quat_base: Optional[np.ndarray] = None,
+        ee_pos: Optional[np.ndarray] = None,
+        ee_quat: Optional[np.ndarray] = None,
     ) -> None:
         rgb = np.asarray(rgb, dtype=np.uint8)
         if rgb.shape != (self._height, self._width, 3):
@@ -122,9 +138,17 @@ class H5SessionWriter:
         vel = np.asarray(base_lin_vel_local, dtype=np.float64).reshape(3)
         quat = np.asarray(base_quat, dtype=np.float64).reshape(4)
         if ee_goal_quat_base is None:
-            ee_quat = np.full(4, np.nan, dtype=np.float64)
+            ee_goal_quat = np.full(4, np.nan, dtype=np.float64)
         else:
-            ee_quat = np.asarray(ee_goal_quat_base, dtype=np.float64).reshape(4)
+            ee_goal_quat = np.asarray(ee_goal_quat_base, dtype=np.float64).reshape(4)
+        if ee_pos is None:
+            meas_pos = np.full(3, np.nan, dtype=np.float64)
+        else:
+            meas_pos = np.asarray(ee_pos, dtype=np.float64).reshape(3)
+        if ee_quat is None:
+            meas_quat = np.full(4, np.nan, dtype=np.float64)
+        else:
+            meas_quat = np.asarray(ee_quat, dtype=np.float64).reshape(4)
 
         i = self._n
         for ds in (
@@ -136,6 +160,8 @@ class H5SessionWriter:
             self._quat,
             self._gripper,
             self._ee_quat,
+            self._ee_pos,
+            self._ee_quat_meas,
         ):
             ds.resize(i + 1, axis=0)
 
@@ -146,7 +172,9 @@ class H5SessionWriter:
         self._vel[i] = vel
         self._quat[i] = quat
         self._gripper[i] = float(gripper_cmd)
-        self._ee_quat[i] = ee_quat
+        self._ee_quat[i] = ee_goal_quat
+        self._ee_pos[i] = meas_pos
+        self._ee_quat_meas[i] = meas_quat
         self._n = i + 1
 
         if self._n % 50 == 0:

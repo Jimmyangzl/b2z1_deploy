@@ -38,6 +38,8 @@ class EeGoalWsServer:
         self._gripper_cmd = float("nan")
         self._base_lin_vel = np.full(3, np.nan, dtype=np.float64)
         self._ee_goal_quat = np.full(4, np.nan, dtype=np.float64)
+        self._ee_pos = np.full(3, np.nan, dtype=np.float64)
+        self._ee_quat_meas = np.full(4, np.nan, dtype=np.float64)
         self._t = 0.0
         self._have_sample = False
         self._clients: Set[WebSocketServerProtocol] = set()
@@ -52,6 +54,8 @@ class EeGoalWsServer:
         gripper_cmd: Optional[float] = None,
         base_lin_vel=None,
         ee_goal_quat_base=None,
+        ee_pos=None,
+        ee_quat=None,
     ) -> None:
         """Store latest EE goal, Z1 gripper command, and base linear velocity.
 
@@ -59,7 +63,8 @@ class EeGoalWsServer:
         (closed=0, open=-1). ``base_lin_vel`` is the same 3-vector printed
         as ``base_lin_vel`` in the WBC observation summary.
         ``ee_goal_quat_base`` is the EE target orientation, wxyz, in the robot
-        base frame. ``None`` means that field is unavailable.
+        base frame. ``ee_pos`` and ``ee_quat`` are the measured EE pose in the
+        arm-base frame (wxyz). ``None`` means that field is unavailable.
         """
         goal = np.asarray(ee_goal_local_cart, dtype=np.float64).reshape(3)
         if gripper_cmd is None:
@@ -74,11 +79,21 @@ class EeGoalWsServer:
             quat = np.full(4, np.nan, dtype=np.float64)
         else:
             quat = np.asarray(ee_goal_quat_base, dtype=np.float64).reshape(4).copy()
+        if ee_pos is None:
+            meas_pos = np.full(3, np.nan, dtype=np.float64)
+        else:
+            meas_pos = np.asarray(ee_pos, dtype=np.float64).reshape(3).copy()
+        if ee_quat is None:
+            meas_quat = np.full(4, np.nan, dtype=np.float64)
+        else:
+            meas_quat = np.asarray(ee_quat, dtype=np.float64).reshape(4).copy()
         with self._lock:
             self._ee_goal = goal.copy()
             self._gripper_cmd = grip
             self._base_lin_vel = vel
             self._ee_goal_quat = quat
+            self._ee_pos = meas_pos
+            self._ee_quat_meas = meas_quat
             self._t = float(time.time() if timestamp is None else timestamp)
             self._have_sample = True
 
@@ -88,6 +103,8 @@ class EeGoalWsServer:
                 "t": self._t,
                 "ee_goal_local_cart": self._ee_goal.tolist(),
                 "ee_goal_quat_base": self._ee_goal_quat.tolist(),
+                "ee_pos": self._ee_pos.tolist(),
+                "ee_quat": self._ee_quat_meas.tolist(),
                 "gripper_cmd": self._gripper_cmd,
                 "base_lin_vel": self._base_lin_vel.tolist(),
                 "valid": bool(self._have_sample and np.all(np.isfinite(self._ee_goal))),

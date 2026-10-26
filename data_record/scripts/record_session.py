@@ -238,6 +238,12 @@ def main() -> int:
                 ee_quat = ee.get("ee_goal_quat_base")
                 if ee_quat is not None:
                     ee_quat = np.asarray(ee_quat, dtype=np.float64).reshape(4)
+                ee_pos = ee.get("ee_pos")
+                if ee_pos is not None:
+                    ee_pos = np.asarray(ee_pos, dtype=np.float64).reshape(3)
+                ee_quat_meas = ee.get("ee_quat")
+                if ee_quat_meas is not None:
+                    ee_quat_meas = np.asarray(ee_quat_meas, dtype=np.float64).reshape(4)
                 if ee.get("t", 0.0) > 0:
                     age = wall_t - float(ee["t"])
                 else:
@@ -250,6 +256,18 @@ def main() -> int:
                     gripper_cmd = float("nan")
                 if ee_quat is None or not fresh or not np.all(np.isfinite(ee_quat)):
                     ee_quat = np.full(4, np.nan, dtype=np.float64)
+                if (
+                    ee_pos is None
+                    or not fresh
+                    or not np.all(np.isfinite(ee_pos))
+                ):
+                    ee_pos = np.full(3, np.nan, dtype=np.float64)
+                if (
+                    ee_quat_meas is None
+                    or not fresh
+                    or not np.all(np.isfinite(ee_quat_meas))
+                ):
+                    ee_quat_meas = np.full(4, np.nan, dtype=np.float64)
                 # Same vector WBC prints as base_lin_vel. Prefer it over the
                 # local sport-topic read, which stays zero after ReleaseMode.
                 ws_vel = ee.get("base_lin_vel")
@@ -264,6 +282,8 @@ def main() -> int:
                 age = float("nan")
                 gripper_cmd = float("nan")
                 ee_quat = np.full(4, np.nan, dtype=np.float64)
+                ee_pos = np.full(3, np.nan, dtype=np.float64)
+                ee_quat_meas = np.full(4, np.nan, dtype=np.float64)
 
             writer.append(
                 timestamp=wall_t,
@@ -274,6 +294,8 @@ def main() -> int:
                 base_quat=base_quat,
                 gripper_cmd=gripper_cmd,
                 ee_goal_quat_base=ee_quat,
+                ee_pos=ee_pos,
+                ee_quat=ee_quat_meas,
             )
 
             if writer.num_frames % max(1, int(rate_hz)) == 0:

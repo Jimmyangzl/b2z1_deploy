@@ -240,6 +240,17 @@ class ObservationBuilder:
         goal_quat_base = getattr(vr_goal, "ee_quat_goal_base", None)
         if goal_quat_base is None:
             goal_quat_base = np.full(4, np.nan, dtype=np.float64)
+        # Measured EE pose in the arm-base frame. Mount is translation-only,
+        # so the quaternion matches the robot-base orientation.
+        if robot.arm_connected:
+            ee_pos = (
+                np.asarray(robot.ee_pos, dtype=np.float64).reshape(3)
+                - self.policy_arm_base_offset
+            )
+            ee_quat = np.asarray(robot.ee_quat, dtype=np.float64).reshape(4).copy()
+        else:
+            ee_pos = np.full(3, np.nan, dtype=np.float64)
+            ee_quat = np.full(4, np.nan, dtype=np.float64)
         # ee_goal_local_cart[0] = 0.4 
         # ee_goal_local_cart[2] = 0.4 
 
@@ -302,6 +313,8 @@ class ObservationBuilder:
             "slices": slices,
             "ee_goal_local_cart": ee_goal_local_cart,
             "ee_goal_quat_base": np.asarray(goal_quat_base, dtype=np.float64).reshape(4).copy(),
+            "ee_pos": np.asarray(ee_pos, dtype=np.float64).reshape(3).copy(),
+            "ee_quat": np.asarray(ee_quat, dtype=np.float64).reshape(4).copy(),
             "base_lin_vel": np.asarray(base_lin_vel, dtype=np.float64).copy(),
             "ee_goal_base": goal_base,
             "ee_goal_world": goal_base,  # back-compat alias (base frame, not sport world)
