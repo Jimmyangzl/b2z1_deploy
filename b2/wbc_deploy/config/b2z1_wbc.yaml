@@ -124,7 +124,7 @@ streaming:
 
 # WBC policy checkpoint (.pt). Optional if passed via --checkpoint on the CLI.
 policy:
-  # checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy/model_30000.pt
+  # checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy-small-step/model_30000.pt
   checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy-small-step/model_32000.pt
   # checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy/model_48000.pt
   # checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy/model_100000.pt
