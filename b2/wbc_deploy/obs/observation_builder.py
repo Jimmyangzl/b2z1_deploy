@@ -125,9 +125,9 @@ class ObservationBuilder:
           xy = dvel_xy_amp * unit(goal in base_yaw xy)
           yaw = dvel_yaw_amp * sign(goal_yaw - base_yaw)
         masks (same as arm_control.update_rfm_state):
-          mask_xy:   (manip_pred > 1e-3 or dist(ee, mount)_xy < 65) and phase < 0.5
+          mask_xy:   (manip_pred > 1e-3 or dist(ee, mount)_xy < 0.65) and phase < 0.5
                      → zero xy
-          mask_back: manip_pred < 5e-4 and dist(ee, mount)_xy < 0.4 and phase < 0.5
+          mask_back: manip_pred < 5e-4 and dist(ee, mount)_xy < 0.1 and phase < 0.5
                      → flip xy
           mask_yaw:  |yaw_err| > 0.785  → keep yaw; else zero yaw
           deadband:  |dvel_i| < commands.*_clip → zero that component
@@ -167,7 +167,8 @@ class ObservationBuilder:
         self.dvel_b_local[2] = self.dvel_yaw_amp * yaw_direction
         ee_euler_error = abs(yaw_diff)
 
-        arm_mount_yaw = self._base_to_base_yaw_pos(self.policy_arm_base_offset, base_quat)
+        # Train (base_sample=False): mount = R_yaw @ offset → offset in yaw frame.
+        arm_mount_yaw = np.asarray(self.policy_arm_base_offset, dtype=np.float64)
         dist_base_ee = float(np.linalg.norm((ee_yaw - arm_mount_yaw)[:2]))
         mask_xy = (
             (manip_pred_last > 0.001) or (dist_base_ee < 0.65)
@@ -175,7 +176,7 @@ class ObservationBuilder:
         mask_yaw = ee_euler_error > 0.785
         mask_back = (
             (manip_pred_last < 0.0005)
-            and (dist_base_ee < 0.4)
+            and (dist_base_ee < 0.1)
             and (self.phase_variable < 0.5)
         )
 

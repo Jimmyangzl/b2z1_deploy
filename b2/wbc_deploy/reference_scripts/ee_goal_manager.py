@@ -149,10 +149,57 @@ class EeGoalManager:
     def resample_on_reset(self, env_ids, is_init=False):
         if self.use_base_sample:
             self.base_resample(env_ids, is_init=is_init)
+            if len(env_ids) > 0:
+                self._apply_base_sample_start(env_ids)
         elif self.cfg.experiment.fine_sample:
             self.fine_resample(env_ids, is_init=is_init)
         else:
             self.resample(env_ids, is_init=is_init)
+            if len(env_ids) > 0:
+                self._apply_yaw_sample_start(env_ids)
+
+    def _assign_far_default_masks(self, env_ids):
+        """Split env_ids into far / default / sphere-near using experiment ratios."""
+        far_ratio = float(getattr(self.cfg.experiment, "base_sample_far_ratio", 0.0))
+        self.base_sample_far[env_ids] = torch.rand(len(env_ids), device=self.device) < far_ratio
+        far_ids = env_ids[self.base_sample_far[env_ids]]
+        near_ids = env_ids[~self.base_sample_far[env_ids]]
+
+        self.base_sample_default[env_ids] = False
+        default_ratio = float(getattr(self.cfg.experiment, "base_sample_default_ratio", 0.0))
+        if len(near_ids) > 0 and default_ratio > 0:
+            default_mask = torch.rand(len(near_ids), device=self.device) < default_ratio
+            default_ids = near_ids[default_mask]
+            sphere_near_ids = near_ids[~default_mask]
+            self.base_sample_default[default_ids] = True
+        else:
+            default_ids = near_ids[:0]
+            sphere_near_ids = near_ids
+        return far_ids, default_ids, sphere_near_ids
+
+    def _default_ee_cart_yaw_frame(self, env_ids):
+        """Map default_ee_cart_arm_base into the spherical-center / base-yaw frame."""
+        n = len(env_ids)
+        cart_ab = self.default_ee_cart_arm_base.unsqueeze(0).expand(n, -1)
+        world = self.get_arm_base_pos(env_ids) + quat_apply(
+            self.env.base_quat[env_ids], cart_ab,
+        )
+        center = self.get_spherical_center()[env_ids]
+        return quat_rotate_inverse(self.env.base_yaw_quat[env_ids], world - center)
+
+    def _reset_traj_timers(self, env_ids):
+        """Resample traj/hold durations and zero the goal timer for env_ids."""
+        if len(env_ids) == 0:
+            return
+        self.traj_timesteps[env_ids] = torch_rand_float(
+            self.cfg.goal_ee.traj_time[0], self.cfg.goal_ee.traj_time[1],
+            (len(env_ids), 1), device=self.device,
+        ).squeeze(1) / self.env.dt
+        self.traj_total_timesteps[env_ids] = self.traj_timesteps[env_ids] + torch_rand_float(
+            self.cfg.goal_ee.hold_time[0], self.cfg.goal_ee.hold_time[1],
+            (len(env_ids), 1), device=self.device,
+        ).squeeze(1) / self.env.dt
+        self.goal_timer[env_ids] = 0.0
 
     def _resample_sphere_once(self, env_ids):
         ranges = self.env.goal_ee_ranges
@@ -207,21 +254,7 @@ class EeGoalManager:
         if len(env_ids) == 0:
             return
 
-        far_ratio = float(getattr(self.cfg.experiment, "base_sample_far_ratio", 0.3))
-        self.base_sample_far[env_ids] = torch.rand(len(env_ids), device=self.device) < far_ratio
-        far_ids = env_ids[self.base_sample_far[env_ids]]
-        near_ids = env_ids[~self.base_sample_far[env_ids]]
-
-        self.base_sample_default[env_ids] = False
-        default_ratio = float(getattr(self.cfg.experiment, "base_sample_default_ratio", 0.0))
-        if len(near_ids) > 0 and default_ratio > 0:
-            default_mask = torch.rand(len(near_ids), device=self.device) < default_ratio
-            default_ids = near_ids[default_mask]
-            sphere_near_ids = near_ids[~default_mask]
-            self.base_sample_default[default_ids] = True
-        else:
-            default_ids = near_ids[:0]
-            sphere_near_ids = near_ids
+        far_ids, default_ids, sphere_near_ids = self._assign_far_default_masks(env_ids)
 
         self._resample_orn_once(env_ids)
         ranges = self.env.goal_ee_ranges
@@ -262,15 +295,28 @@ class EeGoalManager:
             )
             self.ee_goal_sphere[non_default_ids, :] = cart2sphere(self.ee_goal_cart[non_default_ids, :])
 
-        # Start = current EE in arm-base frame.
-        relative_pos_world = self.env.ee_pos[env_ids, :] - arm_base_pos
-        pos_in_base = quat_rotate_inverse(self.env.base_quat[env_ids, :], relative_pos_world)
-        self.ee_start_cart[env_ids, :] = pos_in_base
-        self.ee_start_sphere[env_ids, :] = cart2sphere(pos_in_base)
+        # Start in arm-base frame.
+        # On reset (is_init): rigid-body EE is often still the pre-termination pose after
+        # set_dof_state + refresh (FK not updated until the next physics step), so using
+        # ee_pos makes the first traj start far from the actual reset arm. Use the
+        # configured default EE instead (matches default_dof_pos arm home).
+        if is_init:
+            self.ee_start_cart[env_ids, :] = self.default_ee_cart_arm_base
+            self.ee_start_sphere[env_ids, :] = cart2sphere(self.ee_start_cart[env_ids, :])
+        else:
+            relative_pos_world = self.env.ee_pos[env_ids, :] - arm_base_pos
+            pos_in_base = quat_rotate_inverse(self.env.base_quat[env_ids, :], relative_pos_world)
+            self.ee_start_cart[env_ids, :] = pos_in_base
+            self.ee_start_sphere[env_ids, :] = cart2sphere(pos_in_base)
 
-        self.goal_timer[env_ids] = 0.0
+        self._reset_traj_timers(env_ids)
 
     def resample(self, env_ids, is_init=False):
+        """Sphere goals in the live base-yaw / spherical-center frame.
+
+        Supports base_sample_far_ratio (snap, far ranges) and base_sample_default_ratio
+        (cart lerp to default_ee_cart_arm_base mapped into the yaw frame).
+        """
         if self.cfg.experiment.tele_op:
             self.centers_fixed[env_ids, :] = self.get_ee_pos_fixed(env_ids)
             ee_yaw = euler_from_quat(self.env.ee_orn)[2]
@@ -278,44 +324,106 @@ class EeGoalManager:
             self.reset_tele_op_flag = False
             return
 
-        if len(env_ids) > 0:
-            init_env_ids = env_ids.clone()
+        if len(env_ids) == 0:
+            return
 
+        init_env_ids = env_ids.clone()
+
+        # fix_sample: freeze center/yaw at sample time; no far/default split.
+        if self.cfg.experiment.fix_sample:
             if is_init:
-                if self.cfg.experiment.fix_sample:
-                    self.ee_start_sphere[env_ids] = self.init_start_ee_sphere[:].clone()
-                    for _ in range(10):
-                        self._resample_sphere_once(env_ids)
-                        collision_mask = self._collision_check(env_ids)
-                        env_ids = env_ids[collision_mask]
-                        if len(env_ids) == 0:
-                            break
-                else:
-                    self.ee_goal_orn_delta_rpy[env_ids, :] = 0
-                    self.ee_start_sphere[env_ids] = self.init_start_ee_sphere[:]
-                    self.ee_goal_sphere[env_ids] = self.init_end_ee_sphere[:]
+                self.ee_start_sphere[env_ids] = self.init_start_ee_sphere[:].clone()
+                ids = env_ids
+                for _ in range(10):
+                    if len(ids) == 0:
+                        break
+                    self._resample_sphere_once(ids)
+                    collision_mask = self._collision_check(ids)
+                    ids = ids[collision_mask]
             else:
                 if not self.cfg.debug.test_vel:
                     self._resample_orn_once(env_ids)
                 self.ee_start_sphere[env_ids] = self.ee_goal_sphere[env_ids].clone()
+                self.ee_start_cart[env_ids] = self.ee_goal_cart[env_ids].clone()
                 if not self.cfg.debug.test_vel:
+                    ids = env_ids
                     for _ in range(10):
-                        self._resample_sphere_once(env_ids)
-                        collision_mask = self._collision_check(env_ids)
-                        env_ids = env_ids[collision_mask]
-                        if len(env_ids) == 0:
+                        if len(ids) == 0:
                             break
+                        self._resample_sphere_once(ids)
+                        collision_mask = self._collision_check(ids)
+                        ids = ids[collision_mask]
             self.ee_goal_cart[init_env_ids, :] = sphere2cart(self.ee_goal_sphere[init_env_ids, :])
-            if self.cfg.experiment.fix_sample:
-                self.centers_fixed[init_env_ids, :] = self.get_spherical_center_fixed(init_env_ids)
-                self.base_yaw_quat_fixed[init_env_ids, :] = self.env.base_yaw_quat[init_env_ids, :].clone()
-                relative_pos_world = (
-                    self.env.ee_pos[init_env_ids, :].clone() - self.centers_fixed[init_env_ids, :].clone()
-                )
-                pos_in_fixed = quat_rotate_inverse(self.base_yaw_quat_fixed[init_env_ids, :], relative_pos_world)
-                self.ee_start_sphere[init_env_ids] = cart2sphere(pos_in_fixed)
+            self.centers_fixed[init_env_ids, :] = self.get_spherical_center_fixed(init_env_ids)
+            self.base_yaw_quat_fixed[init_env_ids, :] = self.env.base_yaw_quat[init_env_ids, :].clone()
+            relative_pos_world = (
+                self.env.ee_pos[init_env_ids, :].clone() - self.centers_fixed[init_env_ids, :].clone()
+            )
+            pos_in_fixed = quat_rotate_inverse(self.base_yaw_quat_fixed[init_env_ids, :], relative_pos_world)
+            self.ee_start_sphere[init_env_ids] = cart2sphere(pos_in_fixed)
+            self.ee_start_cart[init_env_ids] = sphere2cart(self.ee_start_sphere[init_env_ids])
+            self.base_sample_far[init_env_ids] = False
+            self.base_sample_default[init_env_ids] = False
+            self._reset_traj_timers(init_env_ids)
+            return
 
-            self.goal_timer[init_env_ids] = 0.0
+        far_ids, default_ids, sphere_near_ids = self._assign_far_default_masks(env_ids)
+        ranges = self.env.goal_ee_ranges
+
+        # Capture previous goals as starts before overwriting (cart-accurate, no sphere roundtrip).
+        if is_init:
+            self.ee_goal_orn_delta_rpy[env_ids, :] = 0.0
+            # Near: classic init_start; default/far: mapped arm-home in yaw frame.
+            self.ee_start_sphere[env_ids] = self.init_start_ee_sphere[:]
+            self.ee_start_cart[env_ids] = sphere2cart(self.ee_start_sphere[env_ids])
+            if len(default_ids) > 0:
+                start_def = self._default_ee_cart_yaw_frame(default_ids)
+                self.ee_start_cart[default_ids] = start_def
+                self.ee_start_sphere[default_ids] = cart2sphere(start_def)
+            if len(far_ids) > 0:
+                # Far snaps, but start still from init_start for a defined previous pose.
+                self.ee_start_sphere[far_ids] = self.init_start_ee_sphere[:]
+                self.ee_start_cart[far_ids] = sphere2cart(self.ee_start_sphere[far_ids])
+        else:
+            if not self.cfg.debug.test_vel:
+                self._resample_orn_once(env_ids)
+            self.ee_start_sphere[env_ids] = self.ee_goal_sphere[env_ids].clone()
+            self.ee_start_cart[env_ids] = self.ee_goal_cart[env_ids].clone()
+
+        # Near sphere goals.
+        if len(sphere_near_ids) > 0:
+            if is_init:
+                # Deterministic first segment (stage1 behavior); no collision reject loop.
+                self.ee_goal_sphere[sphere_near_ids] = self.init_end_ee_sphere[:]
+                self.ee_goal_cart[sphere_near_ids] = sphere2cart(self.ee_goal_sphere[sphere_near_ids])
+            elif not self.cfg.debug.test_vel:
+                ids = sphere_near_ids
+                for _ in range(10):
+                    if len(ids) == 0:
+                        break
+                    self._resample_sphere_with_ranges(
+                        ids, ranges["pos_l"], ranges["pos_p"], ranges["pos_y"],
+                    )
+                    collision_mask = self._collision_check(ids)
+                    ids = ids[collision_mask]
+                self.ee_goal_cart[sphere_near_ids] = sphere2cart(self.ee_goal_sphere[sphere_near_ids])
+            # else test_vel: keep previous ee_goal_* (start already equals previous goal)
+
+        if len(far_ids) > 0:
+            self._resample_sphere_with_ranges(
+                far_ids,
+                ranges.get("base_far_pos_l", ranges["pos_l"]),
+                ranges.get("base_far_pos_p", ranges["pos_p"]),
+                ranges.get("base_far_pos_y", ranges["pos_y"]),
+            )
+            self.ee_goal_cart[far_ids] = sphere2cart(self.ee_goal_sphere[far_ids])
+
+        if len(default_ids) > 0:
+            self.ee_goal_cart[default_ids] = self._default_ee_cart_yaw_frame(default_ids)
+            self.ee_goal_sphere[default_ids] = cart2sphere(self.ee_goal_cart[default_ids])
+            self.ee_goal_orn_delta_rpy[default_ids] = 0.0
+
+        self._reset_traj_timers(init_env_ids)
 
     def assign_sample_categories(self, env_ids):
         ratios = getattr(self.cfg.experiment, "fine_sample_ratios", [0.4, 0.3, 0.3])
@@ -464,7 +572,28 @@ class EeGoalManager:
                         t[rot_mask, None],
                     )
             else:
-                self.curr_ee_goal_sphere[:] = torch.lerp(self.ee_start_sphere, self.ee_goal_sphere, t[:, None])
+                # Yaw-frame path: near sphere lerp; far snap; default cart lerp.
+                self.curr_ee_goal_sphere[:] = torch.lerp(
+                    self.ee_start_sphere, self.ee_goal_sphere, t[:, None],
+                )
+                if self.base_sample_far.any():
+                    self.curr_ee_goal_sphere[self.base_sample_far, :] = self.ee_goal_sphere[
+                        self.base_sample_far, :
+                    ]
+                self.curr_ee_goal_cart[:] = sphere2cart(self.curr_ee_goal_sphere)
+                if self.base_sample_default.any():
+                    # Refresh endpoint in the live yaw frame so home tracks the true default EE.
+                    def_ids = self.base_sample_default.nonzero(as_tuple=False).flatten()
+                    self.ee_goal_cart[def_ids] = self._default_ee_cart_yaw_frame(def_ids)
+                    self.ee_goal_sphere[def_ids] = cart2sphere(self.ee_goal_cart[def_ids])
+                    self.curr_ee_goal_cart[def_ids] = torch.lerp(
+                        self.ee_start_cart[def_ids],
+                        self.ee_goal_cart[def_ids],
+                        t[def_ids, None],
+                    )
+                    self.curr_ee_goal_sphere[def_ids] = cart2sphere(
+                        self.curr_ee_goal_cart[def_ids],
+                    )
 
         default_yaw = torch.zeros(self.num_envs, device=self.device)
 
@@ -503,8 +632,7 @@ class EeGoalManager:
                     self.curr_ee_goal_cart[is_far, :] = sphere2cart(self.ee_goal_sphere[is_far, :])
                 if (~is_far).any():
                     self.curr_ee_goal_cart[~is_far, :] = sphere2cart(self.curr_ee_goal_sphere[~is_far, :])
-            else:
-                self.curr_ee_goal_cart[:] = sphere2cart(self.curr_ee_goal_sphere)
+            # else: yaw-frame cart already set above (incl. far/default ratios)
 
         if self.use_base_sample:
             arm_base_pos = self.get_arm_base_pos()
@@ -530,6 +658,7 @@ class EeGoalManager:
                 )
         elif self.cfg.experiment.fix_sample and not self.cfg.experiment.fine_sample:
             ee_goal_cart_yaw_global = quat_apply(self.base_yaw_quat_fixed, self.curr_ee_goal_cart)
+            default_yaw[:] = torch.atan2(ee_goal_cart_yaw_global[:, 1], ee_goal_cart_yaw_global[:, 0])
             self.curr_ee_goal_cart_world = self.centers_fixed + ee_goal_cart_yaw_global
             self.curr_ee_goal_cart_world[:, 2] = torch.clip(self.curr_ee_goal_cart_world[:, 2], 0.3, 0.8)
         elif self.cfg.experiment.fix_sample and self.cfg.experiment.fine_sample:
@@ -545,9 +674,14 @@ class EeGoalManager:
             self.curr_ee_goal_cart_world[:, 2] = torch.clip(self.curr_ee_goal_cart_world[:, 2], 0.3, 0.8)
         elif self.cfg.experiment.tele_op:
             ee_goal_cart_yaw_global = quat_apply(self.base_yaw_quat_fixed, self.curr_ee_goal_cart)
+            default_yaw[:] = torch.atan2(ee_goal_cart_yaw_global[:, 1], ee_goal_cart_yaw_global[:, 0])
         else:
+            # Live yaw-frame: align EE X with the horizontal reach direction (center → goal).
             ee_goal_cart_yaw_global = quat_apply(self.env.base_yaw_quat, self.curr_ee_goal_cart)
+            default_yaw[:] = torch.atan2(ee_goal_cart_yaw_global[:, 1], ee_goal_cart_yaw_global[:, 0])
             self.curr_ee_goal_cart_world = self.get_spherical_center() + ee_goal_cart_yaw_global
+            if self.base_sample_default.any():
+                default_yaw[self.base_sample_default] = 0.0
 
         if self.cfg.experiment.use_rfm:
             # default_pitch = -self.ee_goal_sphere[:, 1] + self.cfg.goal_ee.arm_induced_pitch
@@ -555,10 +689,12 @@ class EeGoalManager:
         else:
             # default_pitch = -self.curr_ee_goal_sphere[:, 1] + self.cfg.goal_ee.arm_induced_pitch
             default_pitch = -self.curr_ee_goal_sphere[:, 1]
-        if self.use_base_sample and self.base_sample_default.any():
+        if self.base_sample_default.any():
             default_pitch = default_pitch.clone()
             default_pitch[self.base_sample_default] = 0.0
             self.ee_goal_orn_delta_rpy[self.base_sample_default, :] = 0.0
+            default_yaw = default_yaw.clone()
+            default_yaw[self.base_sample_default] = 0.0
         self.ee_goal_orn_quat = quat_from_euler_xyz(
             # self.ee_goal_orn_delta_rpy[:, 0] + np.pi / 2,
             self.ee_goal_orn_delta_rpy[:, 0],
@@ -566,7 +702,7 @@ class EeGoalManager:
             # self.ee_goal_orn_delta_rpy[:, 1],
             self.ee_goal_orn_delta_rpy[:, 2] + default_yaw,
         )
-        if self.use_base_sample and self.base_sample_default.any():
+        if self.base_sample_default.any():
             mask = self.base_sample_default
             n = int(mask.sum().item())
             orn_local = self.default_ee_orn_quat_arm_base.unsqueeze(0).expand(n, -1)
@@ -581,10 +717,131 @@ class EeGoalManager:
             self.env.commands[resample_id, 2] = 0
         if self.use_base_sample:
             self.base_resample(resample_id, is_init=False)
+            # Resample runs after curr was built for the old traj; snap curr to the new
+            # start immediately so this step's IK/obs/viz are not left at the old endpoint.
+            if len(resample_id) > 0:
+                self._apply_base_sample_start(resample_id)
         elif self.cfg.experiment.fine_sample:
             self.fine_resample(resample_id, is_init=False)
         else:
             self.resample(resample_id)
+            if len(resample_id) > 0:
+                self._apply_yaw_sample_start(resample_id)
+
+    def _apply_yaw_sample_start(self, env_ids):
+        """Set curr EE goal to t=0 start after yaw-frame resample (far snaps to goal)."""
+        if len(env_ids) == 0:
+            return
+        far = self.base_sample_far[env_ids]
+        default = self.base_sample_default[env_ids]
+        near = ~(far | default)
+
+        if far.any():
+            ids = env_ids[far]
+            self.curr_ee_goal_cart[ids] = self.ee_goal_cart[ids]
+            self.curr_ee_goal_sphere[ids] = self.ee_goal_sphere[ids]
+        if default.any():
+            ids = env_ids[default]
+            self.curr_ee_goal_cart[ids] = self.ee_start_cart[ids]
+            self.curr_ee_goal_sphere[ids] = cart2sphere(self.curr_ee_goal_cart[ids])
+        if near.any():
+            ids = env_ids[near]
+            self.curr_ee_goal_sphere[ids] = self.ee_start_sphere[ids]
+            self.curr_ee_goal_cart[ids] = self.ee_start_cart[ids]
+
+        center = self.get_spherical_center()[env_ids]
+        ee_goal_cart_yaw_global = quat_apply(
+            self.env.base_yaw_quat[env_ids], self.curr_ee_goal_cart[env_ids],
+        )
+        self.curr_ee_goal_cart_world[env_ids] = center + ee_goal_cart_yaw_global
+
+        # Orientation for these envs at t=0 (match update_curr).
+        default_yaw = torch.atan2(ee_goal_cart_yaw_global[:, 1], ee_goal_cart_yaw_global[:, 0])
+        if self.cfg.experiment.use_rfm:
+            default_pitch = -self.ee_goal_sphere[env_ids, 1]
+        else:
+            default_pitch = -self.curr_ee_goal_sphere[env_ids, 1]
+        if self.base_sample_default[env_ids].any():
+            default_pitch = default_pitch.clone()
+            default_pitch[self.base_sample_default[env_ids]] = 0.0
+            default_yaw = default_yaw.clone()
+            default_yaw[self.base_sample_default[env_ids]] = 0.0
+            self.ee_goal_orn_delta_rpy[env_ids[self.base_sample_default[env_ids]], :] = 0.0
+        self.ee_goal_orn_quat[env_ids] = quat_from_euler_xyz(
+            self.ee_goal_orn_delta_rpy[env_ids, 0],
+            self.ee_goal_orn_delta_rpy[env_ids, 1] + default_pitch,
+            self.ee_goal_orn_delta_rpy[env_ids, 2] + default_yaw,
+        )
+        if self.base_sample_default[env_ids].any():
+            mask_local = self.base_sample_default[env_ids]
+            ids = env_ids[mask_local]
+            n = len(ids)
+            orn_local = self.default_ee_orn_quat_arm_base.unsqueeze(0).expand(n, -1)
+            self.ee_goal_orn_quat[ids] = quat_mul(self.env.base_quat[ids], orn_local)
+
+    def _apply_base_sample_start(self, env_ids):
+        """Set curr EE goal to the just-captured start (t=0) for resampled envs."""
+        if len(env_ids) == 0:
+            return
+        far = self.base_sample_far[env_ids]
+        default = self.base_sample_default[env_ids]
+        near = ~(far | default)
+
+        # Far: intentional snap to final goal (no interpolation).
+        if far.any():
+            ids = env_ids[far]
+            self.curr_ee_goal_cart[ids] = self.ee_goal_cart[ids]
+            self.curr_ee_goal_sphere[ids] = self.ee_goal_sphere[ids]
+        if default.any():
+            ids = env_ids[default]
+            self.curr_ee_goal_cart[ids] = self.ee_start_cart[ids]
+            self.curr_ee_goal_sphere[ids] = cart2sphere(self.curr_ee_goal_cart[ids])
+        if near.any():
+            ids = env_ids[near]
+            self.curr_ee_goal_cart[ids] = self.ee_start_cart[ids]
+            self.curr_ee_goal_sphere[ids] = self.ee_start_sphere[ids]
+
+        arm_base_pos = self.get_arm_base_pos(env_ids)
+        ee_goal_cart_base_global = quat_apply(self.env.base_quat[env_ids], self.curr_ee_goal_cart[env_ids])
+        self.curr_ee_goal_cart_world[env_ids] = arm_base_pos + ee_goal_cart_base_global
+
+        z_lo, z_hi = getattr(self.cfg.experiment, "base_sample_z_range", [0.3, 0.8])
+        non_default = env_ids[~self.base_sample_default[env_ids]]
+        if len(non_default) > 0:
+            self.curr_ee_goal_cart_world[non_default, 2] = torch.clip(
+                self.curr_ee_goal_cart_world[non_default, 2], float(z_lo), float(z_hi),
+            )
+            nd_arm = self.get_arm_base_pos(non_default)
+            self.curr_ee_goal_cart[non_default] = quat_rotate_inverse(
+                self.env.base_quat[non_default],
+                self.curr_ee_goal_cart_world[non_default] - nd_arm,
+            )
+            self.curr_ee_goal_sphere[non_default] = cart2sphere(self.curr_ee_goal_cart[non_default])
+
+        # Orientation consistent with update_curr for these envs.
+        default_yaw = torch.atan2(ee_goal_cart_base_global[:, 1], ee_goal_cart_base_global[:, 0])
+        if self.base_sample_default[env_ids].any():
+            default_yaw = default_yaw.clone()
+            default_yaw[self.base_sample_default[env_ids]] = 0.0
+        if self.cfg.experiment.use_rfm:
+            default_pitch = -self.ee_goal_sphere[env_ids, 1]
+        else:
+            default_pitch = -self.curr_ee_goal_sphere[env_ids, 1]
+        if self.base_sample_default[env_ids].any():
+            default_pitch = default_pitch.clone()
+            default_pitch[self.base_sample_default[env_ids]] = 0.0
+            self.ee_goal_orn_delta_rpy[env_ids[self.base_sample_default[env_ids]], :] = 0.0
+        self.ee_goal_orn_quat[env_ids] = quat_from_euler_xyz(
+            self.ee_goal_orn_delta_rpy[env_ids, 0],
+            self.ee_goal_orn_delta_rpy[env_ids, 1] + default_pitch,
+            self.ee_goal_orn_delta_rpy[env_ids, 2] + default_yaw,
+        )
+        if self.base_sample_default[env_ids].any():
+            mask_local = self.base_sample_default[env_ids]
+            ids = env_ids[mask_local]
+            n = len(ids)
+            orn_local = self.default_ee_orn_quat_arm_base.unsqueeze(0).expand(n, -1)
+            self.ee_goal_orn_quat[ids] = quat_mul(self.env.base_quat[ids], orn_local)
 
     def reset_goal_timer(self, env_ids):
         self.goal_timer[env_ids] = 0.

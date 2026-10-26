@@ -34,13 +34,28 @@ import numpy as np
 class B2Z1WBCRoughCfg( LeggedRobotCfg ):
     class experiment:
         fix_arm = False
-        use_cmd = True
+        use_cmd = False
         fix_sample = False
+        # When True (and fix_sample=False): sample EE goals in the live Z1 arm-base frame (base_quat).
+        # When False: sample in the live base-yaw / spherical-center frame (stage1-style).
+        base_sample = False
+        # Fraction of goals that snap (no interpolation). Applies to base_sample and yaw-frame sampling.
+        base_sample_far_ratio = 0.0 # 0.2
+        # Among non-far goals, fraction that end at default EE. Applies to base_sample and yaw-frame.
+        # Yaw-frame: default_ee_cart_arm_base is mapped into the spherical-center / yaw frame.
+        base_sample_default_ratio = 0.2 # 0.2
+        # World-frame EE height limits for base_sample goals [m].
+        base_sample_z_range = [0.35, 0.8]
+        # RFM dvel_b_local XY amplitude [m/s] (unit direction × amp). Far goals use the larger value.
+        dvel_xy_amp = 0.15
+        dvel_xy_amp_far = 0.3
         far_sample = False
         fine_sample = False
+        # Probabilities for SPHERE / BACK / ROT when fine_sample is on (need not sum to 1; normalized at use).
+        fine_sample_ratios = [1.0, 0.0, 0.0]
         use_rfm = True
         use_prio_reward = True
-        flag_inference = False
+        flag_inference = True
         tele_op = False
 
     class debug:
@@ -51,7 +66,8 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
     class goal_ee:
         num_commands = 3
         traj_time = [3, 5]
-        hold_time = [0.5, 2]
+        hold_time = [1.0, 2.0]
+        # hold_time = [1, 3]
         collision_upper_limits = [0.1, 0.2, -0.05]
         collision_lower_limits = [-0.8, -0.2, -0.7]
         underground_limit = -0.7
@@ -63,25 +79,36 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
             # x_offset = 0.3 # Relative to base
             x_offset = 0.15 # Relative to base
             # x_offset = 0.0
+            # x_offset = 0.35 # Relative to base
             y_offset = 0 # Relative to base
             # z_invariant_offset = 0.7 # Relative to terrain
-            z_invariant_offset = 0.55
+            z_invariant_offset = 0.7
 
         class ranges:
             init_pos_start = [0.5, np.pi/8, 0]
             init_pos_end = [0.7, 0, 0]
             # init_pos_start = [0.0, 0, 0]
             # init_pos_end = [0.1, 0, 0]
-            pos_l = [0.4, 0.95] # USE this when using cmds
-            # pos_l = [1., 5.0]
+            # pos_l = [0.4, 0.95] # USE this when using cmds
+            pos_l = [0.5, 1.0]
+            # pos_l = [0.7, 1.5]
+            # pos_l = [1., 3.0]
             # pos_p = [-1 * np.pi / 2.5, 1 * np.pi / 3]
-            pos_p = [-1 * np.pi / 12, 1 * np.pi / 6]
-            # pos_y = [-1.2, 1.2]
+            pos_p = [-1 * np.pi / 6, 1 * np.pi / 12]
+            pos_y = [-np.pi/3 - 0.2, np.pi/3 + 0.2]
             # pos_y = [-2*np.pi/3, 2*np.pi/3] # 3*np.pi/5
-            pos_y = [-np.pi/3.0, np.pi/3.0]
+            # pos_y = [-np.pi/3.0, np.pi/3.0]
+
+            # base_sample far subset (no interpolation): separate sphere ranges
+            base_far_pos_l = [2.0, 2.5]
+            base_far_pos_p = [-1 * np.pi / 12, 1 * np.pi / 12]
+            base_far_pos_y = [-np.pi/12.0, np.pi/12.0]
+
+            back_pos_l = [0.3, 0.5]
             
             delta_orn_r = [-0.5, 0.5]
-            delta_orn_p = [-0.5, 0.5]
+            # delta_orn_p = [-0.5, 0.5]
+            delta_orn_p = [-0.1, 0.3]
             delta_orn_y = [-0.5, 0.5]
 
             final_tracking_ee_reward = 0.55
@@ -104,23 +131,28 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
         curriculum = True
         num_commands = 3
         # resampling_time = 3. # time before command are changed[s]
-        resampling_time = 10.
+        resampling_time = 4.
 
         # lin_vel_x_schedule = [0, 2.0]
         # lin_vel_y_schedule = [0, 2.0]
         # ang_vel_yaw_schedule = [0, 1]
         # tracking_ang_vel_yaw_schedule = [0, 1]
 
-        ang_vel_yaw_clip = 0.05
-        lin_vel_x_clip = 0.02
-        lin_vel_y_clip = 0.02
-        lin_vel_clip = 0.02
+        # ang_vel_yaw_clip = 0.5
+        # lin_vel_x_clip = 0.8
+        # lin_vel_y_clip = 0.8
+        ang_vel_yaw_clip = 0.2
+        lin_vel_x_clip = 0.1
+        lin_vel_y_clip = 0.1
+        lin_vel_clip = 0.1
 
         class ranges:
             # lin_vel_x = [-0.8, 0.8] # min max [m/s]
-            lin_vel_x = [-1.5, 1.5] # min max [m/s]
-            lin_vel_y = [-1.5, 1.5] # min max [m/s]
-            ang_vel_yaw = [-1.0, 1.0]    # min max [rad/s]
+            # lin_vel_y = [-0.8, 0.8] # min max [m/s]
+            # ang_vel_yaw = [-1.0, 1.0]    # min max [rad/s]
+            lin_vel_x = [-0.3, 0.3] # min max [m/s]
+            lin_vel_y = [-0.3, 0.3] # min max [m/s]
+            ang_vel_yaw = [-0.5, 0.5]    # min max [rad/s]
 
     class normalization:
         class obs_scales:
@@ -130,12 +162,14 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
             dof_vel = 0.05
             height_measurements = 5.0
         clip_observations = 100.
-        clip_actions = 100.
+        clip_actions = 20.
         clip_lmbdas = 2.
 
     class env:
-        num_envs = 2048 #4096
+        num_envs = 4096 #4096
         num_actions = 12  # legs only; arm pose via IK
+        # num_actions = 12 + 6 + 2 #CAUTION
+        # num_actions = 12 + 6 #CAUTION
         num_torques = 12 + 6
         action_delay = 3  # -1 for no delay
         num_gripper_joints = 1
@@ -152,11 +186,11 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
         teleop_mode = False # Overriden in teleop.py. When true, commands come from keyboard
         record_video = False
         stand_by = False
-        observe_gait_commands = False
+        observe_gait_commands = True
         frequencies = 2
         
     class init_state( LeggedRobotCfg.init_state ):
-        pos = [0.0, 0.0, 0.5] # x,y,z [m]
+        pos = [0.0, 0.0, 0.55] # x,y,z [m]
         default_joint_angles = { # = target angles [rad] when action = 0.0
             # 'FL_hip_joint': 0.2,   # [rad]
             'FL_hip_joint': 0.0,   # [rad]
@@ -185,13 +219,14 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
             # 'z1_wrist_rotate': 1.57,#0.0,
             # 'z1_jointGripper': -0.785,
             'z1_waist': 0.0,
-            # 'z1_shoulder': 0.1,
-            'z1_shoulder': 2*np.pi/3,
-            # 'z1_elbow': -0.1,
-            'z1_elbow': -2*np.pi/3,
-            'z1_wrist_angle': -0.0,
+            'z1_shoulder': 1.8,
+            # 'z1_shoulder': 2*np.pi/3,
+            'z1_elbow': -0.9,
+            # 'z1_elbow': -2*np.pi/3,
+            'z1_wrist_angle': -0.9,
             'z1_forearm_roll': 0.0,
-            'z1_wrist_rotate': 1.57,#0.0,
+            # 'z1_wrist_rotate': 1.57,#0.0,
+            'z1_wrist_rotate': 0.0,
             'z1_jointGripper': -0.785,
         }
         # rand_yaw_range = np.pi/2
@@ -205,12 +240,70 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
         init_vel_perturb_range = 0.0
 
     class control:
-        stiffness = {'joint': 80, 'z1': 5}  # [N*m/rad] # Kp: 80, 150, 200
-        damping = {'joint': 2.0, 'z1': 0.5}     # [N*m*s/rad]
+        # Per-leg-joint PD gains [N*m/rad] / [N*m*s/rad]. Keys must be substrings of dof names.
+        # stiffness = {
+        #     'FL_hip_joint': 200,
+        #     'FL_thigh_joint': 200,
+        #     'FL_calf_joint': 200,
+        #     'FR_hip_joint': 200,
+        #     'FR_thigh_joint': 200,
+        #     'FR_calf_joint': 200,
+        #     'RL_hip_joint': 200,
+        #     'RL_thigh_joint': 200,
+        #     'RL_calf_joint': 200,
+        #     'RR_hip_joint': 200,
+        #     'RR_thigh_joint': 200,
+        #     'RR_calf_joint': 200,
+        #     'z1': 100,
+        # }
+        # damping = {
+        #     'FL_hip_joint': 10.0,
+        #     'FL_thigh_joint': 10.0,
+        #     'FL_calf_joint': 10.0,
+        #     'FR_hip_joint': 10.0,
+        #     'FR_thigh_joint': 10.0,
+        #     'FR_calf_joint': 10.0,
+        #     'RL_hip_joint': 10.0,
+        #     'RL_thigh_joint': 10.0,
+        #     'RL_calf_joint': 10.0,
+        #     'RR_hip_joint': 10.0,
+        #     'RR_thigh_joint': 10.0,
+        #     'RR_calf_joint': 10.0,
+        #     'z1': 5.0,
+        # }
+        stiffness = {'joint': 200, 'z1': 5}  # [N*m/rad] # Kp: 80, 150, 200
+        damping = {'joint': 10.0, 'z1': 0.5}     # [N*m*s/rad]
 
         adaptive_arm_gains = False
         # action scale: target angle = actionScale * action + defaultAngle
         action_scale = [0.4, 0.45, 0.45] * 2 + [0.4, 0.45, 0.45] * 2 + [2.1, 0.6, 0.6, 0, 0, 0]
+        # Hard clamp on desired joint positions [rad]. None disables.
+        # Defaults match b2z1.urdf <limit lower/upper>. Gripper omitted (held at default).
+        hard_dof_pos_limit = {
+            'FL_hip_joint': (-0.2, 0.2),
+            'FL_thigh_joint': (-0.94, 1.0),
+            'FL_calf_joint': (-2.82, -1.0),
+            'FR_hip_joint': (-0.2, 0.2),
+            'FR_thigh_joint': (-0.94, 1.0),
+            'FR_calf_joint': (-2.82, -1.0),
+            'RL_hip_joint': (-0.2, 0.2),
+            'RL_thigh_joint': (-0.94, 1.0),
+            'RL_calf_joint': (-2.82, -1.0),
+            'RR_hip_joint': (-0.2, 0.2),
+            'RR_thigh_joint': (-0.94, 1.0),
+            'RR_calf_joint': (-2.82, -1.0),
+            'z1_waist': (-2.5, 2.5),
+            # 'z1_shoulder': (0.0, 3.141592653589793),
+            'z1_shoulder': (0.0, 2.8),
+            # 'z1_elbow': (-3.0, 0.0),
+            'z1_elbow': (-2.5, 0.0),
+            # 'z1_wrist_angle': (-1.7453292519943295, 1.5707963267948966),
+            'z1_wrist_angle': (-1.5, 1.5),
+            # 'z1_forearm_roll': (-1.7278759594743864, 1.7278759594743864),
+            'z1_forearm_roll': (-1.5, 1.5),
+            # 'z1_wrist_rotate': (-2.792526803190927, 2.792526803190927),
+            'z1_wrist_rotate': (-2.5, 2.5),
+        }
         # decimation: Number of control action updates @ sim DT per policy DT
         decimation = 4
         torque_supervision = False
@@ -260,7 +353,10 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
         feet_wall_height_range = [-0.2, 0.2]
     
     class arm:
-        init_target_ee_base = [0.2, 0.0, 0.2]
+        init_target_ee_base = [0.5, 0.0, 0.4]
+        # EE cart / orn (rpy) in arm-base frame at default_joint_angles (base_sample_default_ratio).
+        default_ee_cart_arm_base = [0.5, 0.0, 0.4]
+        default_ee_orn_arm_base = [0.0, 0.0, 0.0]
         grasp_offset = 0.08
         osc_kp = np.array([100, 100, 100, 30, 30, 30])
         osc_kd = 2 * (osc_kp ** 0.5)
@@ -269,7 +365,7 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
         observe_priv = True
         # observe_priv = False
         randomize_friction = True
-        friction_range = [0.02, 1.5] # [0.5, 3.0]
+        friction_range = [0.4, 1.5] # [0.5, 3.0]
         randomize_base_mass = True
         added_mass_range = [0., 15.]
         randomize_base_com = True
@@ -283,6 +379,7 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
         leg_motor_strength_range = [0.7, 1.3]
         arm_motor_strength_range = [0.7, 1.3]
         randomize_gripper_mass = True
+        # gripper_added_mass_range = [0, 0.1]
         gripper_added_mass_range = [0, 2.0]
         push_robots = True
         push_interval_s = 5
@@ -297,15 +394,15 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
         tracking_ee_sigma = 1
         soft_dof_pos_limit = 0.95  # percentage of urdf limits, values above this limit are penalized
         soft_dof_vel_limit = 0.95
-        # soft_torque_limit = 0.4
         soft_torque_limit = 0.8
-        base_height_target = 0.38
-        max_contact_force = 200.  # forces above this value are penalized
+        base_height_target = 0.5
+        max_contact_force = 300.  # forces above this value are penalized
         # -------Gait control Para. ---------
         gait_vel_sigma = 0.5
         gait_force_sigma = 0.5
         kappa_gait_probs = 0.07
-        feet_height_target = 0.3
+        # feet_height_target = 0.3
+        feet_height_target = 0.05
 
         feet_aritime_allfeet = True
         feet_height_allfeet = True
@@ -314,70 +411,71 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
         # To not compute and log a given metric, set the scale to None
         class scales:
             # -------Gait control rewards ---------
-            tracking_contacts_shaped_force = -2.0 # Only works when `observing_gait_commands` is true
-            tracking_contacts_shaped_vel = -2.0 # Only works when `observing_gait_commands` is true
+            # tracking_contacts_shaped_force = -4.0 # Only works when `observing_gait_commands` is true
+            # tracking_contacts_shaped_vel = -4.0 # Only works when `observing_gait_commands` is true
+            tracking_contacts_shaped_force = 4.0 # Only works when `observing_gait_commands` is true
+            tracking_contacts_shaped_vel = 4.0 # Only works when `observing_gait_commands` is true
             
             feet_air_time = 2.0
+            # feet_air_time = 0.5
             feet_height = 1.0
+            # feet_height = 0.5
 
             # -------Tracking rewards ----------
-            tracking_lin_vel_max = 5.0 # Test 5.0 use this when using cmd
-            base_acc = 0.5
+            tracking_lin_vel_max = None
             tracking_lin_vel_x_l1 = None
             
             tracking_lin_vel_x_exp = None
             tracking_lin_vel_y = None
-            tracking_ang_vel = 2.0 # 1.0 use this when using cmd
-            # tracking_ang_vel = None
-            tracking_lin_vel = None # Test use vel_max... 5.0 use this when using cmd
+            tracking_ang_vel = None # 2.0 use this when using cmd
+            tracking_lin_vel = None # 5.0 use this when using cmd
 
-            delta_torques = -1.0e-7/4.0
-            work = None
+            base_acc = 1.0
             energy_square = None
             # torques = -2.5e-5 
             torques = -2.0e-5 
-            stand_still = 1.0
+            stand_still = 10.0
+            stand_still_vel = None
             # stand_still = None
-            # walking_dof = 1.5
-            walking_dof = None
+            walking_dof = 2.0
+            # walking_dof = None
             dof_default_pos = None
             dof_error = None
             alive = 1.0
             # alive = 0.0
-            # lin_vel_z = -1.5
-            lin_vel_z = None
-            # roll = -2
-            roll = None
+            lin_vel_z = -1.5
+            # lin_vel_z = None
+            roll = -2
+            # roll = None
 
             front_feet_goal = None
             rear_feet_approach = None
-            # front_feet_goal = 0.
-            # rear_feet_approach = 0.
 
             # common rewards
-            # ang_vel_xy = -0.2
-            # ang_vel_xy = -0.5
-            ang_vel_xy = None
-            ang_vel_x = None
+            ang_vel_xy = -0.2
+            # Penalize base roll angular velocity ω_x (body frame).
+            ang_vel_x = -0.5
             dof_acc = -7.5e-7 
             collision = -10.
             # action_rate = -0.015
             action_rate = -0.25
-            dof_pos_limits = -1.0
+            dof_pos_limits = -10.0
             delta_torques = -1.0e-7
-            hip_pos = -0.3
-            # hip_pos = -0.0
-            # work = -0.003
-            work = 0.
-            # feet_jerk = -0.0002
+            # hip_pos = -0.3
+            hip_pos = -1.0
+            work = -0.003
             feet_jerk = None
+            # feet_jerk = None
             # feet_drag = -0.08
-            feet_drag = None
-            # feet_contact_forces = -0.001
-            feet_contact_forces = None
-            orientation = None
+            feet_drag = -0.15
+            # feet_drag = None
+            feet_contact_forces = -0.001
+            # feet_contact_forces = None
+            orientation = -1.0
             orientation_walking = None
             orientation_standing = None
+            # Reward avoiding base pitching upward (negative pitch from euler_from_quat); exp form.
+            base_pitch_neg = 5.0
             base_height = -5.0
             # base_height = -0.0
             torques_walking = None
@@ -390,14 +488,16 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
             penalty_lin_vel_y = None
 
             base_pos = None
-            # tracking_base_vel = 3.0
-            manipulability = None # 1.0
+            manipulability = 1.0 # 1.0 USE None when using cmds
             # tracking_base_vel = 1.0 # 2.0
+            regularize_lambda = None
         
         class loco_scales:
-            loco_base_height = None
-            tracking_v_base = None
-            loco_pitch = None
+            loco_base_height = 1.0
+            # tracking_v_base = 5.0
+            tracking_v_base_max = 5.0
+            tracking_ang_v_base = 2.0
+            loco_pitch = -5.0
 
         class arm_scales:
             arm_termination = None
@@ -405,9 +505,11 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
             # tracking_ee_world = 0.8
             # tracking_ee_world = 2.0
             # tracking_ee_orn_quat = 1.0
-            tracking_base_vel = None # 5.0
-            tracking_ee_world = 1.0
-            tracking_ee_orn_quat = None
+            # tracking_dvel_b_local = 5.0 # 5.0 Use None when using cmds
+            tracking_dvel_b_local_max = 5.0 # 5.0 Use None when using cmds
+            tracking_ang_dvel_b_local = 2.0 # 5.0 Use None when using cmds
+            tracking_ee_world = 0.8
+            tracking_ee_orn_quat = 0.5
             tracking_ee_sphere_walking = None
             tracking_ee_sphere_standing = None
             tracking_ee_cart = None
@@ -433,8 +535,8 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
         vertical_scale = 0.002 # [m]
         border_size = 25 # [m]
         # height = [0.00, 0.1] # [0.04, 0.1]
-        # height = [0.00, 0.005] # [0.04, 0.1]
-        height = [0.00, 0.001]
+        height = [0.00, 0.001] # [0.04, 0.1]
+        # height = [0.00, 0.001]
         gap_size = [0.02, 0.1]
         stepping_stone_distance = [0.02, 0.08]
         downsampled_scale = 0.075
@@ -478,39 +580,14 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
         slope_treshold = None # slopes above this threshold will be corrected to vertical surfaces
         origin_zero_z = True
 
-    # class joint_limits:
-    #     # joint limits for the robot
-    #     # [min, max] in radians
-    #     joint_limits = np.array([
-    #         [-1.5, 1.5],  # FL_hip_joint
-    #         [-1.5, 1.5],  # FL_thigh_joint
-    #         [-2.0, 0.0],  # FL_calf_joint
-
-    #         [-1.5, 1.5],  # RL_hip_joint
-    #         [-1.5, 1.5],  # RL_thigh_joint
-    #         [-2.0, 0.0],  # RL_calf_joint
-
-    #         [-1.5, 1.5],  # FR_hip_joint
-    #         [-1.5, 1.5],  # FR_thigh_joint
-    #         [-2.0, 0.0],  # FR_calf_joint
-
-    #         [-1.5, 1.5],  # RR_hip_joint
-    #         [-1.5, 1.5],  # RR_thigh_joint
-    #         [-2.0, 0.0],  # RR_calf_joint
-
-    #         [-np.pi/2, np.pi/2],   # z1_waist
-    #         [0., np.pi/2],         # z1_shoulder
-    #         [-np.pi/2, np.pi/2],   # z1_elbow
-    #         [0., np.pi/2],         # z1_wrist_angle
-    #         [0., np.pi/2],         # z1_forearm_roll
-    #         [0., np.pi/2]          # z1_wrist_rotate
-    #     ])
 
 class B2Z1WBCRoughCfgPPO(LeggedRobotCfgPPO):
     seed = 1
     runner_class_name = 'OnPolicyRunner'
     class policy:
         continue_from_last_std = True
+        # init_std = [[0.8, 1.0, 1.0] * 4 + [1.0] * 6]
+        # init_std = [[0.8, 1.0, 1.0] * 4 + [1.0] * 8]
         init_std = [[0.8, 1.0, 1.0] * 4]
         actor_hidden_dims = [128]
         critic_hidden_dims = [128]
@@ -525,6 +602,8 @@ class B2Z1WBCRoughCfgPPO(LeggedRobotCfgPPO):
 
         num_leg_actions = 12
         num_arm_actions = 0
+        # num_arm_actions = 6+2
+        # num_arm_actions = 6
 
         adaptive_arm_gains = B2Z1WBCRoughCfg.control.adaptive_arm_gains
         adaptive_arm_gains_scale = 10.0
@@ -534,8 +613,8 @@ class B2Z1WBCRoughCfgPPO(LeggedRobotCfgPPO):
         value_loss_coef = 1.0
         use_clipped_value_loss = True
         clip_param = 0.2
-        # entropy_coef = 0.0
-        entropy_coef = 0.005
+        entropy_coef = 0.0
+        # entropy_coef = 0.01
         num_learning_epochs = 5
         num_mini_batches = 4 # mini batch size = num_envs*nsteps / nminibatches
         learning_rate = 2e-4 
@@ -545,6 +624,8 @@ class B2Z1WBCRoughCfgPPO(LeggedRobotCfgPPO):
         lam = 0.95
         desired_kl = None
         max_grad_norm = 1.
+        # min_policy_std = [[0.15, 0.25, 0.25] * 4 + [0.2] * 3 + [0.05] * 3]
+        # min_policy_std = [[0.15, 0.25, 0.25] * 4 + [0.2] * 3 + [0.05] * 3 + [0.02] * 2]
         min_policy_std = [[0.15, 0.25, 0.25] * 4]
 
         mixing_schedule=[1.0, 0, 3000] #if not RESUME else [1.0, 0, 1]
@@ -561,7 +642,7 @@ class B2Z1WBCRoughCfgPPO(LeggedRobotCfgPPO):
         num_steps_per_env = 24
         max_iterations = 50000 # number of policy updates
         # logging
-        save_interval = 2000 # check for potential saves every this many iterations
+        save_interval = 500 # check for potential saves every this many iterations
         experiment_name = 'b2z1_v2'
         run_name = ''
         # load and resume

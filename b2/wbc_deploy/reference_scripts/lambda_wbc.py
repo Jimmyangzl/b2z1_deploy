@@ -642,7 +642,7 @@ class lambdaWBC(LeggedRobot):
         self.num_bodies = self.gym.get_asset_rigid_body_count(robot_asset)
         dof_props_asset = self.gym.get_asset_dof_properties(robot_asset)
         dof_props_asset['driveMode'][12:].fill(gymapi.DOF_MODE_POS)  # set arm to pos control
-        dof_props_asset['stiffness'][12:].fill(400.0)
+        dof_props_asset['stiffness'][12:].fill(800.0)
         dof_props_asset['damping'][12:].fill(20.0)
         # dof_props_asset['driveMode'][:].fill(gymapi.DOF_MODE_EFFORT)  # set all joints to pos control
         # dof_props_asset['stiffness'][:].fill(100.0)

@@ -6,3 +6,5 @@ websockets>=10.0
 pyrealsense2>=2.50
 # Optional if camera negotiates a non-640x480 color stream:
 opencv-python-headless>=4.5
+# Relative-traj visualizer (scripts/viz_relative_traj.py):
+matplotlib>=3.5

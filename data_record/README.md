@@ -81,3 +81,49 @@ python scripts/record_session.py --task task_1 --no-b2 --no-ee --rate 20
 | `base_quat` | `(N, 4)` | IMU wxyz |
 
 File attrs: `record_rate_hz`, `ee_ws_url`, `interface`, `camera_serial`, `created_at`, `num_frames`.
+
+## Relative trajectory transform
+
+Converts each recorded frame into a horizon of poses expressed in the **arm-base
+mount frame at time `t`**. Base motion is recovered by integrating
+`base_lin_vel_local * dt` (`dt = 1 / record_rate_hz`) with `base_quat` rotations.
+Past the episode end, the last relative pose is repeated (stationary pad).
+
+```bash
+cd ~/unitree_deploy/b2z1_deploy/data_record
+# Single episode (e.g. validate):
+python scripts/make_relative_traj.py --task test --chunk-n 20 --episode 1
+
+# All episodes under recordings/<task>/:
+python scripts/make_relative_traj.py --task test --chunk-n 20
+
+# Optional arm-mount override (default 0.15 0 0.10):
+python scripts/make_relative_traj.py --task test --chunk-n 20 --arm-offset 0.15 0 0.10
+```
+
+Writes `recordings/relative_traj/<task>/episode_*.h5` (overwrites if present).
+Episodes with any NaN in `ee_goal_local_cart`, `ee_goal_quat_base`,
+`base_lin_vel_local`, `base_quat`, or `gripper_cmd` are reported and skipped.
+
+| Dataset | Shape | Notes |
+|---------|-------|-------|
+| `timestamp` | `(T,)` | Copied from source |
+| `rgb` | `(T, H, W, 3)` | Copied unchanged |
+| `ee_goal_cart_chunk` | `(T, n, 3)` | EE goal in arm-base frame at `t` |
+| `ee_goal_quat_chunk` | `(T, n, 4)` | EE quat wxyz in arm-base frame at `t` |
+| `gripper_cmd` | `(T, n)` | Sliced/padded gripper command |
+
+Extra attrs: `chunk_n`, `dt`, `arm_base_offset`, `source_path`, `relative_traj`.
+
+### Visualize a relative episode
+
+Interactive matplotlib UI: RGB | 3D EE chunk in `F_t` (arm-base axes at origin,
+orientation frames, markers colored by `gripper_cmd`). Slider scrubs `t`.
+
+```bash
+cd ~/unitree_deploy/b2z1_deploy/data_record
+python scripts/viz_relative_traj.py --task test --episode 1
+# or:
+python scripts/viz_relative_traj.py --path recordings/relative_traj/test/episode_1.h5
+# optional: --frame-scale 0.02  --t0 100
+```

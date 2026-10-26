@@ -117,7 +117,7 @@ class ArmController:
         dist_base_ee = torch.norm(env.ee_pos[:, :2] - arm_base_pos[:, :2], p=2, dim=1)
 
         mask_xy = (
-            ((env.manip.manip_det_pred[:, -1] > 0.001) | (dist_base_ee < 0.7))
+            ((env.manip.manip_det_pred[:, -1] > 0.001) | (dist_base_ee < 0.65))
             & (self.phase_variable < 0.5)
         ).unsqueeze(-1).expand_as(self.dvel_b_local[:, :2])
         mask_yaw = (
@@ -132,7 +132,7 @@ class ArmController:
         
         mask_back = (
             (env.manip.manip_det_pred[:, -1] < 0.0005)
-            & (dist_base_ee < 0.4)
+            & (dist_base_ee < 0.1)
             & (self.phase_variable < 0.5)
         ).unsqueeze(-1).expand_as(self.dvel_b_local[:, :2])
 
