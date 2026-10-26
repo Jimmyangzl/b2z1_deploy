@@ -124,7 +124,8 @@ streaming:
 
 # WBC policy checkpoint (.pt). Optional if passed via --checkpoint on the CLI.
 policy:
-  checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy/model_30000.pt
+  # checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy/model_30000.pt
+  checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy-small-step/model_32000.pt
   # checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy/model_48000.pt
   # checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy/model_100000.pt
   # checkpoint: null
@@ -165,17 +166,15 @@ init_deploy_joint:
   # RL: [-2.5622e-02,  7.2960e-01, -1.5496e+00]
   # RR: [1.4613e-01,  8.4543e-01, -1.5455e+00]
 
-  FL: [5.1990e-02,  7.5517e-01, -1.5543e+00]
-  FR: [1.7152e-01,  7.9700e-01, -1.6008e+00]
-  RL: [3.2238e-02,  7.3613e-01, -1.5858e+00]
-  RR: [8.9729e-02,  8.3601e-01, -1.6023e+00]
+  # FL: [5.1990e-02,  7.5517e-01, -1.5543e+00]
+  # FR: [1.7152e-01,  7.9700e-01, -1.6008e+00]
+  # RL: [3.2238e-02,  7.3613e-01, -1.5858e+00]
+  # RR: [8.9729e-02,  8.3601e-01, -1.6023e+00]
 
-  
-
-  # FL: [-6.0595e-03,  7.6799e-01, -1.8676e+00]
-  # FR: [-1.7777e-01,  8.3545e-01, -1.8027e+00]
-  # RL: [1.7937e-01,  2.7837e-01, -1.5569e+00]
-  # RR: [-3.1511e-01, 8.3602e-01, -1.7081e+00]
+  FL: [2.2980e-02,  6.9664e-01, -1.6319e+00]
+  FR: [9.0408e-02,  6.8347e-01, -1.6360e+00]
+  RL: [1.1369e-02,  6.6347e-01, -1.4966e+00,]
+  RR: [-3.3321e-02,  7.0714e-01, -1.4326e+00]
 
          
                 

@@ -60,6 +60,13 @@ class B2StateReader:
         deadline = time.time() + 30.0
         while time.time() < deadline:
             status, result = msc.CheckMode()
+            if result is None:
+                raise RuntimeError(
+                    "MotionSwitcher CheckMode returned None "
+                    f"(status={status}). Check B2 power, Ethernet link, "
+                    f"and --interface ({self.interface}). "
+                    "If already in lowcmd, retry with --no-release-mode."
+                )
             if not result.get("name"):
                 return
             msc.ReleaseMode()
