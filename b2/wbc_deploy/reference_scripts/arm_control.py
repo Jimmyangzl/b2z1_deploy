@@ -89,16 +89,34 @@ class ArmController:
         self.dpos_b_local = quat_rotate_inverse(env.base_yaw_quat, dpos_b_world)
 
         dvel_b_local_norm = torch.norm(self.dpos_b_local[:, :2], p=2, dim=1, keepdim=True)
-        amp = float(getattr(self.cfg.experiment, "dvel_xy_amp", 0.2))
-        # Larger amp for far goals (base_sample or yaw-frame base_sample_far_ratio).
+        # Per-axis amps (fallback to legacy dvel_xy_amp if only that is set).
+        xy_amp_legacy = getattr(self.cfg.experiment, "dvel_xy_amp", None)
+        amp_x = float(getattr(self.cfg.experiment, "dvel_x_amp", xy_amp_legacy if xy_amp_legacy is not None else 0.2))
+        amp_y = float(getattr(self.cfg.experiment, "dvel_y_amp", xy_amp_legacy if xy_amp_legacy is not None else 0.2))
         if hasattr(env, "ee_goals") and hasattr(env.ee_goals, "base_sample_far"):
-            amp_far = float(getattr(self.cfg.experiment, "dvel_xy_amp_far", amp))
-            amp = torch.where(
-                env.ee_goals.base_sample_far,
-                torch.full((self.num_envs,), amp_far, device=self.device),
-                torch.full((self.num_envs,), amp, device=self.device),
-            ).unsqueeze(-1)
-        self.dvel_b_local[:, :2] = amp * self.dpos_b_local[:, :2] / (dvel_b_local_norm[:, :2] + 1e-8)
+            xy_far_legacy = getattr(self.cfg.experiment, "dvel_xy_amp_far", None)
+            amp_x_far = float(getattr(
+                self.cfg.experiment, "dvel_x_amp_far",
+                xy_far_legacy if xy_far_legacy is not None else amp_x,
+            ))
+            amp_y_far = float(getattr(
+                self.cfg.experiment, "dvel_y_amp_far",
+                xy_far_legacy if xy_far_legacy is not None else amp_y,
+            ))
+            far = env.ee_goals.base_sample_far
+            amp_x = torch.where(
+                far,
+                torch.full((self.num_envs,), amp_x_far, device=self.device),
+                torch.full((self.num_envs,), amp_x, device=self.device),
+            )
+            amp_y = torch.where(
+                far,
+                torch.full((self.num_envs,), amp_y_far, device=self.device),
+                torch.full((self.num_envs,), amp_y, device=self.device),
+            )
+        unit_xy = self.dpos_b_local[:, :2] / (dvel_b_local_norm + 1e-8)
+        self.dvel_b_local[:, 0] = amp_x * unit_xy[:, 0]
+        self.dvel_b_local[:, 1] = amp_y * unit_xy[:, 1]
         self.dvel_b_local[:, 2] = 0.4 * env.manip.yaw_direction[:, 0]
 
         _, _, ee_goal_yaw = euler_from_quat(env.ee_goal_orn_quat)
@@ -117,7 +135,7 @@ class ArmController:
         dist_base_ee = torch.norm(env.ee_pos[:, :2] - arm_base_pos[:, :2], p=2, dim=1)
 
         mask_xy = (
-            ((env.manip.manip_det_pred[:, -1] > 0.001) | (dist_base_ee < 0.65))
+            ((env.manip.manip_det_pred[:, -1] > 0.001) | (dist_base_ee < 0.6))
             & (self.phase_variable < 0.5)
         ).unsqueeze(-1).expand_as(self.dvel_b_local[:, :2])
         mask_yaw = (
@@ -126,8 +144,9 @@ class ArmController:
             # & (ee_euler_error > 0.1)
             (ee_euler_error > 0.785)
         )
-        # print(mask_yaw)
+        # print(mask_xy)
         # print(env.manip.manip_det_pred[:, -1])
+        # print(dist_base_ee)
 
         
         mask_back = (

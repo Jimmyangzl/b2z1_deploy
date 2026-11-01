@@ -126,7 +126,7 @@ def main() -> int:
         ts = f["timestamp"][:]
         chunk_n = int(f.attrs.get("chunk_n", cart.shape[1]))
         dt = float(f.attrs.get("dt", 0.05))
-        arm_off = np.asarray(f.attrs.get("arm_base_offset", [0.15, 0.0, 0.1]), dtype=np.float64)
+        arm_off = np.asarray(f.attrs.get("arm_base_offset", [0.03, 0.0, 0.09]), dtype=np.float64)
 
     t_len, n, _ = cart.shape
     if rgb.shape[0] != t_len:

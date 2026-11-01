@@ -2,11 +2,24 @@
 """Deploy B2Z1 WBC on the real robot. Motor commands gated behind --execute-actions."""
 
 import os
+
+# Must run before NumPy/PyTorch import: default OpenBLAS=32 / GOMP=24 threads on this
+# machine. Tiny 50 Hz control ops then oversubscribe the CPU next to SteamVR and the
+# policy wall-clock spikes to 100–300 ms even though MLP compute is <1 ms.
+for _k in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+):
+    os.environ.setdefault(_k, "1")
+
 import signal
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -32,7 +45,15 @@ from control.gains import GainLike, as_gain_vector
 from control.incremental_ik import incremental_ik_step
 from safety.leg_shutdown import leg_joint_dict_to_array, run_leg_soft_shutdown
 from utils.math_utils import pos_quat_to_homogeneous, rotmat_to_quaternion
-from wbc_runtime import build_arg_parser, load_runtime, print_obs_summary, run_policy
+from wbc_runtime import (
+    LAST_POLICY_TIMING,
+    ProcessPolicyWorker,
+    build_arg_parser,
+    load_runtime,
+    print_obs_summary,
+    run_policy,
+    warmup_policy,
+)
 
 
 def _maybe_publish_ee(publisher, obs_pack: dict, gripper_cmd=None, z1_writer=None) -> None:
@@ -228,12 +249,18 @@ class Z1ArmWriter:
         self._Tdes0: Optional[np.ndarray] = None
         # Last EE goal pose used for IK, in arm-base / FK frame (4x4).
         self._last_T_goal: Optional[np.ndarray] = None
+        self._status_tick = 0
         self._last_status: dict = {
             "vr_connected": False,
             "holding": False,
             "Tdes0_locked": False,
             "has_ik": None,
             "tdes_trans_norm": 0.0,
+            "trel_trans_norm": 0.0,
+            "pos_err": 0.0,
+            "rot_err": 0.0,
+            "q_err": 0.0,
+            "loop_ms": 0.0,
             "mode": "idle",
             "fsm": fsm_mode,
         }
@@ -243,17 +270,20 @@ class Z1ArmWriter:
         return clip_dof_pos(q, self._arm_lo, self._arm_hi)
 
     def toggle_gripper(self) -> float:
-        """Toggle commanded gripper between closed (0) and open (-1)."""
+        """Toggle commanded gripper between closed (0) and open (-1).
+
+        Called from the hotkey thread — do **not** print here. A ``print(...,
+        flush=True)`` on a background thread holds the GIL / can block on the
+        TTY and stalls both the 50 Hz arm loop and async policy (seen as
+        policy wait=100ms+ with cpu≪wall, right next to ``[gripper]`` lines).
+        Gripper state is already visible on the 1 Hz ``arm_teleop`` status.
+        """
         with self._gripper_lock:
             if abs(self._gripper_pos - self.gripper_closed) < 1e-6:
                 self._gripper_pos = float(self.gripper_open)
-                state = "open"
             else:
                 self._gripper_pos = float(self.gripper_closed)
-                state = "closed"
-            pos = float(self._gripper_pos)
-        print(f"[gripper] {state} ({pos:.1f})", flush=True)
-        return pos
+            return float(self._gripper_pos)
 
     def gripper_command(self) -> float:
         with self._gripper_lock:
@@ -347,7 +377,12 @@ class Z1ArmWriter:
             f"fsm={self.fsm_mode} vr_connected={s.get('vr_connected')} "
             f"holding={s.get('holding')} "
             f"Tdes0={s.get('Tdes0_locked')} |Tdes|={s.get('tdes_trans_norm'):.3f} "
-            f"hasIK={ik_s} mode={s.get('mode')} gripper={g_s}({g:.1f})"
+            f"|T_rel|={float(s.get('trel_trans_norm') or 0.0):.3f} "
+            f"hasIK={ik_s} |e_pos|={float(s.get('pos_err') or 0.0):.3f} "
+            f"|e_rot|={float(s.get('rot_err') or 0.0):.3f} "
+            f"|dq|={float(s.get('q_err') or 0.0):.3f} "
+            f"loop={float(s.get('loop_ms') or 0.0):.0f}ms "
+            f"mode={s.get('mode')} gripper={g_s}({g:.1f})"
         )
 
     def _goal_pose_arm_frame_wbc(self, robot, vr_goal) -> np.ndarray:
@@ -362,7 +397,7 @@ class Z1ArmWriter:
         return pos_quat_to_homogeneous(goal_pos_arm, goal_quat)
 
     def _solve_ik(self, T_goal: np.ndarray, q_seed: np.ndarray) -> Optional[np.ndarray]:
-        """SDK analytical IK (used by experimental ``wbc`` arm mode only)."""
+        """SDK analytical IK. ``has_ik`` mirrors teleop_z1 MoveL gating."""
         has_ik, q_result = self._arm_model.inverseKinematics(T_goal, q_seed, False)
         self._last_status["has_ik"] = bool(has_ik)
         if not has_ik:
@@ -376,9 +411,25 @@ class Z1ArmWriter:
             dtype=np.float64,
         ).reshape(4, 4)
         J = np.asarray(self._arm_model.CalcJacobian(q_meas), dtype=np.float64)
-        q_goal, _dpose = incremental_ik_step(J, T_ee, T_goal, q_meas)
-        self._last_status["has_ik"] = q_goal is not None
+        q_goal, dpose = incremental_ik_step(J, T_ee, T_goal, q_meas)
+        self._last_status["pos_err"] = float(np.linalg.norm(dpose[3:6]))
+        self._last_status["rot_err"] = float(np.linalg.norm(dpose[0:3]))
         return q_goal
+
+    def _pose_error_norms(self, T_goal: np.ndarray, q_meas: np.ndarray) -> Tuple[float, float]:
+        T_ee = np.asarray(
+            self._arm_model.forwardKinematics(q_meas, 6),
+            dtype=np.float64,
+        ).reshape(4, 4)
+        dpos = float(np.linalg.norm(T_goal[:3, 3] - T_ee[:3, 3]))
+        # Cheap rotation magnitude via orientation_error path inside incremental helper.
+        from utils.math_utils import orientation_error, rotmat_to_quaternion
+
+        qg = rotmat_to_quaternion(T_goal[:3, :3])
+        qe = rotmat_to_quaternion(T_ee[:3, :3])
+        qe = qe / max(float(np.linalg.norm(qe)), 1e-12)
+        drot = float(np.linalg.norm(orientation_error(qg, qe)))
+        return dpos, drot
 
     def _vr_pose_dict(self, vr_goal) -> dict:
         client = getattr(vr_goal, "client", None)
@@ -386,25 +437,25 @@ class Z1ArmWriter:
             return {}
         return client.get_latest_pose()
 
-    def _ensure_T_init(self, vr_pose: dict, q_meas: np.ndarray) -> np.ndarray:
-        if self._T_init is not None:
-            return self._T_init
-        if vr_pose.get("T_init") is not None:
-            self._T_init = np.asarray(vr_pose["T_init"], dtype=np.float64).reshape(4, 4).copy()
-            print(
-                "[Z1ArmWriter] Using server T_init for teleop arm control.",
-                flush=True,
-            )
-            return self._T_init
+    def _lock_teleop_baselines(self, Tdes: np.ndarray, q_meas: np.ndarray) -> None:
+        """Engage teleop like teleop_z1: T_init = FK(now), Tdes0 = Tdes(now).
+
+        Do NOT use z1_robot_prep's server T_init here. That pose is from prep
+        time; locking it with a later Tdes0 makes T_goal = T_init_prep @ T_rel
+        so "draw back to zero" aims at the prep pose while the arm may be
+        elsewhere — feels permanently stuck off the tracker null.
+        """
         self._T_init = np.asarray(
             self._arm_model.forwardKinematics(q_meas, 6),
             dtype=np.float64,
         ).reshape(4, 4)
+        self._Tdes0 = np.asarray(Tdes, dtype=np.float64).reshape(4, 4).copy()
+        self._last_status["Tdes0_locked"] = True
         print(
-            "[Z1ArmWriter] No server T_init; using current FK as T_init.",
+            "[Z1ArmWriter] Locked teleop baselines at current EE "
+            "(T_init=FK(q_meas), Tdes0=Tdes).",
             flush=True,
         )
-        return self._T_init
 
     def _cmd_from_tdes(self, vr_goal, q_meas: np.ndarray) -> np.ndarray:
         """Teleop law: T_goal = T_init @ inv(Tdes0) @ Tdes."""
@@ -427,27 +478,66 @@ class Z1ArmWriter:
             }
         )
 
-        T_init = self._ensure_T_init(vr_pose, q_meas)
-
         if not connected or Tdes is None:
+            # Keep baselines across brief dropouts so drawing the tracker back
+            # still reduces T_rel toward I and pulls the arm with it.
             self._last_status["mode"] = "hold_no_vr"
             return self._q_hold if self._q_hold is not None else q_meas.copy()
 
         Tdes = np.asarray(Tdes, dtype=np.float64).reshape(4, 4)
-        if self._Tdes0 is None:
-            self._Tdes0 = Tdes.copy()
-            self._last_status["Tdes0_locked"] = True
-            print("[Z1ArmWriter] Locked Tdes0 (teleop baseline).", flush=True)
+        if self._Tdes0 is None or self._T_init is None:
+            self._lock_teleop_baselines(Tdes, q_meas)
 
         T_rel = np.linalg.inv(self._Tdes0) @ Tdes
-        T_goal = T_init @ T_rel
+        T_goal = self._T_init @ T_rel
         self._store_T_goal(T_goal)
-        q_ik = self._solve_ik_incremental(T_goal, q_meas)
-        if q_ik is None:
-            self._last_status["mode"] = "hold_ik_fail"
-            return self._q_hold if self._q_hold is not None else q_meas.copy()
-        self._last_status["mode"] = "tdes_inc_ik"
-        return q_ik
+        self._last_status["trel_trans_norm"] = float(
+            np.linalg.norm(T_rel[:3, 3])
+        )
+        # Pose-error norms are display-only; skip most ticks (FK every cycle
+        # is unnecessary for JOINTCTRL).
+        if (self._status_tick % 50) == 0:
+            pos_err, rot_err = self._pose_error_norms(T_goal, q_meas)
+            self._last_status["pos_err"] = pos_err
+            self._last_status["rot_err"] = rot_err
+        self._status_tick += 1
+
+        # Match teleop_z1 when hasIK. When analytical fails, do NOT keep full-pose
+        # incremental (that walks elbow→0 and then "draw back" cannot recover).
+        # Retry with goal position + *current* EE orientation (position-only
+        # teleop). Low-manip poses with hasIK=True are still accepted unchanged.
+        # Cap per-tick joint step so pos_only → full-pose re-engage (or a
+        # distant analytical solution) cannot snap |dq|~0.4+ in one packet.
+        dq_max = 0.25
+
+        q_ana = self._solve_ik(T_goal, q_meas)
+        if q_ana is not None:
+            q_cmd = q_meas + np.clip(q_ana - q_meas, -dq_max, dq_max)
+            self._last_status["mode"] = "tdes_ana"
+        else:
+            T_ee = np.asarray(
+                self._arm_model.forwardKinematics(q_meas, 6),
+                dtype=np.float64,
+            ).reshape(4, 4)
+            T_pos_only = T_ee.copy()
+            T_pos_only[:3, 3] = T_goal[:3, 3]
+            q_pos = self._solve_ik(T_pos_only, q_meas)
+            if q_pos is not None:
+                # has_ik left False from full-pose fail; position-only is OK.
+                self._last_status["has_ik"] = False
+                q_cmd = q_meas + np.clip(q_pos - q_meas, -dq_max, dq_max)
+                self._last_status["mode"] = "tdes_pos_only"
+            else:
+                # Last resort: incremental on position-only target (drot≈0).
+                q_ik = self._solve_ik_incremental(T_pos_only, q_meas)
+                if q_ik is None:
+                    self._last_status["mode"] = "hold_ik_fail"
+                    return q_meas.copy()
+                q_cmd = q_meas + np.clip(q_ik - q_meas, -dq_max, dq_max)
+                self._last_status["mode"] = "tdes_inc_pos"
+
+        self._last_status["q_err"] = float(np.linalg.norm(q_cmd - q_meas))
+        return q_cmd
 
     def _cmd_from_wbc(
         self,
@@ -486,6 +576,7 @@ class Z1ArmWriter:
         if not self._ensure_ready():
             return
 
+        t_send0 = time.perf_counter()
         q_meas = np.asarray(robot.arm_q, dtype=np.float64).reshape(6)
         if self._q_hold is None:
             self._q_hold = q_meas.copy()
@@ -493,10 +584,12 @@ class Z1ArmWriter:
         t_goal_before = self._last_T_goal
         if self.control_mode == "tdes":
             q_cmd = self._cmd_from_tdes(vr_goal, q_meas)
+            # teleop_z1 does not apply training hard_dof clips on arm cmd.
         else:
             q_cmd = self._cmd_from_wbc(robot, vr_goal, phase_variable, q_meas)
+            q_cmd = self._apply_joint_limits(q_cmd)
+        t_ik = time.perf_counter()
 
-        q_cmd = self._apply_joint_limits(q_cmd)
         self._q_hold = q_cmd.copy()
         # If this step did not compute a new T_goal (hold / homing), use FK of q_cmd.
         if self._last_T_goal is t_goal_before or self._last_T_goal is None:
@@ -514,6 +607,9 @@ class Z1ArmWriter:
         self._arm.tau = tau_f
         self._arm.setArmCmd(_vec6(q_cmd), _vec6(qd_cmd), _vec6(tau_f))
         self._arm.setGripperCmd(self.gripper_command(), 0.0, 0.0)
+        t_cmd = time.perf_counter()
+        self._last_status["arm_ik_ms"] = (t_ik - t_send0) * 1000.0
+        self._last_status["arm_cmd_ms"] = (t_cmd - t_ik) * 1000.0
 
 def leg_targets_from_action(
     action: np.ndarray,
@@ -560,6 +656,7 @@ def run_init_deploy_sequence(
     ramp_s = float(config.get("init_deploy_ramp_s", 5.0))
     hold_s = float(config.get("init_deploy_hold_s", 5.0))
     use_cmd = bool(config["commands"].get("use_cmd"))
+    clip_actions = float(config.get("control", {}).get("clip_actions", 20.0))
     print_every = max(1, int(rate))
 
     print(
@@ -581,7 +678,9 @@ def run_init_deploy_sequence(
         if robot.valid:
             obs_pack = obs_builder.build(robot, vr_goal)
             action = run_policy(policy, obs_pack["obs_vector"])
-            obs_builder.update_action_history(action)
+            action = obs_builder.update_action_history(
+                action, clip_actions=clip_actions
+            )
             if z1_writer is not None:
                 z1_writer.send(
                     gripper_q=robot.gripper_q,
@@ -617,7 +716,9 @@ def run_init_deploy_sequence(
         if robot.valid:
             obs_pack = obs_builder.build(robot, vr_goal)
             action = run_policy(policy, obs_pack["obs_vector"])
-            obs_builder.update_action_history(action)
+            action = obs_builder.update_action_history(
+                action, clip_actions=clip_actions
+            )
             if z1_writer is not None:
                 z1_writer.send(
                     gripper_q=robot.gripper_q,
@@ -671,6 +772,9 @@ def run_init_deploy_sequence(
         return False
 
     print("Confirmed. Switching to policy gains and applying policy actions.")
+    # Drop init ramp/hold policy leftovers so step-0 obs matches a clean episode start.
+    obs_builder.reset()
+    print("  obs/action history reset after confirm (clean last_leg_actions).")
     lowcmd_writer.set_gains(config["control"]["kp"], config["control"]["kd"])
     return True
 
@@ -773,7 +877,8 @@ def main() -> None:
     config, aggregator, vr_goal, obs_builder, policy, rate, dt = load_runtime(
         args, defer_release=defer_release
     )
-    if policy is None:
+    # --arm-only intentionally leaves policy=None in-process (child loads ckpt).
+    if policy is None and not (args.arm_only and args.checkpoint):
         print(
             "Error: checkpoint required. Set policy.checkpoint in b2z1_wbc.yaml "
             "or pass --checkpoint /path/to/model.pt"
@@ -933,7 +1038,29 @@ def main() -> None:
     print("\nB2Z1 WBC deploy")
     print(f"  execute_actions: {args.execute_actions}")
     print(f"  arm_only       : {args.arm_only}")
-    print(f"  apply_policy   : {apply_policy and not args.arm_only}")
+    # Policy net always runs in the control loop (loco-manip timing). apply_policy
+    # only gates whether leg targets are sent to lowcmd (never for --arm-only).
+    if args.arm_only:
+        print(
+            f"  policy_eval    : child process "
+            f"({(config.get('policy') or {}).get('device', 'cpu')})"
+        )
+    else:
+        print(f"  policy_eval    : True (every tick)")
+        try:
+            from policy.controller_loader import device as _policy_device
+            import torch as _torch
+
+            print(
+                f"  policy_device  : {_policy_device} "
+                f"(torch_num_threads={_torch.get_num_threads()})"
+            )
+        except Exception:
+            pass
+    print(
+        f"  apply_leg_cmd  : {bool(apply_policy and not args.arm_only)} "
+        f"({'sport mode; actions discarded' if args.arm_only else 'lowcmd from policy' if apply_policy else 'hold init'})"
+    )
     print(
         f"  hotkeys        : "
         f"gripper={'on' if z1_writer is not None else 'off'} "
@@ -985,57 +1112,242 @@ def main() -> None:
     _print_command_mode(config)
     print("Press Ctrl+C to stop.\n")
 
+    # --arm-only: policy in a *separate process* (own GIL). A background thread
+    # still shares this process's GIL with obs/VR — that was the remaining
+    # wait≫cpu + obs/arm stalls after ~30s. Child process cannot block teleop.
+    async_policy = None
+    if args.arm_only and args.checkpoint:
+        _n_thr = int((config.get("policy") or {}).get("num_threads", 1) or 1)
+        _dev = str((config.get("policy") or {}).get("device", "cpu"))
+        async_policy = ProcessPolicyWorker(
+            checkpoint=str(args.checkpoint),
+            device=_dev,
+            num_threads=_n_thr,
+        )
+        async_policy.start()
+        print(
+            "[policy] process worker on (arm-only): separate GIL; "
+            "teleop process does not load Torch.",
+            flush=True,
+        )
+    elif policy is not None:
+        warmup_policy(policy, n=50)
+
     step = 0
+    max_work_ms = 0.0
+    max_stages_ms = {}
+    action = np.zeros(12, dtype=np.float64)
+    # Alloc churn is reduced; disable GC in the teleop process so rare full
+    # collections cannot hold the GIL for 50–150 ms mid-run. Policy child has
+    # its own GC. RSS should stay flat (was ~450MB steady, not growing).
+    import gc as _gc
+    import resource as _resource
+
+    from policy.constants import num_observations as _num_observations
+
+    _gc.collect()
+    _gc.disable()
+    _last_lag_note_t = 0.0
+    print_hz_divider = max(1, int(rate))
+    # Arm-only: never build WBC obs on the 50 Hz teleop hot path. Logs showed
+    # policy wait=0 while obs=30–67ms still stretched the *next* arm tick
+    # (send-then-obs still overruns dt). Rebuild at 1 Hz for prints; feed the
+    # policy child a cached vector at 25 Hz for loco-manip CPU load only.
+    _load_sim_obs = np.zeros(_num_observations, dtype=np.float64)
+    _last_obs_pack = {
+        "phase_variable": 0.0,
+        "obs_vector": _load_sim_obs,
+        "slices": {},
+        "ee_goal_world": np.zeros(3),
+        "ee_goal_base": np.zeros(3),
+        "use_cmd": False,
+        "commands": np.zeros(3),
+        "dvel_b_local": np.zeros(3),
+    }
     try:
         while not shutdown["stop"]:
             t0 = time.perf_counter()
             robot = aggregator.read()
+            t_read = time.perf_counter()
             if not robot.valid:
                 time.sleep(0.05)
                 continue
 
-            obs_pack = obs_builder.build(robot, vr_goal)
-            action = run_policy(policy, obs_pack["obs_vector"])
-            obs_builder.update_action_history(action)
+            do_print = step % print_hz_divider == 0
+            policy_stage_ms = 0.0
+            leg_q_target = q_init
 
-            if apply_policy and not args.arm_only:
-                leg_q_target = leg_targets_from_action(
-                    action, default_dof, action_scale, clip_actions=clip_actions
-                )
-            else:
-                leg_q_target = q_init
-
-            # Arm Tdes teleop whenever Z1 writer is active (--arm-only or full deploy).
-            if z1_writer is not None:
-                z1_writer.send(
-                    gripper_q=robot.gripper_q,
-                    robot=robot,
-                    vr_goal=vr_goal,
-                    obs_builder=obs_builder,
-                    phase_variable=obs_pack["phase_variable"],
-                )
-            # Publish after send so ee_goal_* match the IK T_goal (arm-base).
-            _maybe_publish_ee(
-                ee_goal_publisher,
-                obs_pack,
-                None if z1_writer is None else z1_writer.gripper_command(),
-                z1_writer=z1_writer,
-            )
-
-            if args.verbose or step % max(1, int(rate)) == 0:
-                print_obs_summary(
-                    step,
-                    obs_pack,
-                    action,
-                    use_cmd=bool(obs_builder.use_cmd or config["commands"].get("use_cmd")),
-                )
-                if args.arm_only:
-                    print("  leg_cmd        : sport mode (no lowcmd; --arm-only)")
-                elif args.execute_actions and not apply_policy:
-                    print("  leg_cmd        : holding init_deploy_joint (policy not applied)")
+            if args.arm_only:
                 if z1_writer is not None:
-                    print("  arm_cmd        : Tdes incremental IK → JOINTCTRL")
+                    z1_writer.send(
+                        gripper_q=robot.gripper_q,
+                        robot=robot,
+                        vr_goal=vr_goal,
+                        obs_builder=obs_builder,
+                        phase_variable=0.0,
+                    )
+                t_arm = time.perf_counter()
+
+                obs_ms = 0.0
+                if do_print:
+                    t_ob0 = time.perf_counter()
+                    obs_pack = obs_builder.build(
+                        robot, vr_goal, debug=bool(args.verbose)
+                    )
+                    _load_sim_obs = np.asarray(
+                        obs_pack["obs_vector"], dtype=np.float64
+                    ).reshape(-1)
+                    _last_obs_pack = obs_pack
+                    obs_ms = (time.perf_counter() - t_ob0) * 1000.0
+                else:
+                    obs_pack = _last_obs_pack
+
+                # Cheap shared-memory copy only — no obs_builder on this path.
+                if async_policy is not None and (do_print or step % 2 == 0):
+                    async_policy.submit(_load_sim_obs)
+                    ready = async_policy.take_action()
+                    if ready is not None:
+                        action = obs_builder.update_action_history(
+                            ready, clip_actions=clip_actions
+                        )
+                    policy_stage_ms = float(async_policy.last_infer_ms)
+
+                if do_print:
+                    _maybe_publish_ee(
+                        ee_goal_publisher,
+                        obs_pack,
+                        None if z1_writer is None else z1_writer.gripper_command(),
+                        z1_writer=z1_writer,
+                    )
+
+                work_ms = (time.perf_counter() - t0) * 1000.0
+                stages_ms = {
+                    "read": (t_read - t0) * 1000.0,
+                    "arm": (t_arm - t_read) * 1000.0,
+                    "obs": obs_ms,
+                    "policy": policy_stage_ms,
+                }
+                # Arm feel = read+arm only (obs only on 1 Hz print ticks).
+                teleop_ms = stages_ms["read"] + stages_ms["arm"]
+            else:
+                obs_pack = obs_builder.build(robot, vr_goal, debug=do_print)
+                t_obs = time.perf_counter()
+
+                if apply_policy:
+                    action = run_policy(policy, obs_pack["obs_vector"])
+                    action = obs_builder.update_action_history(
+                        action, clip_actions=clip_actions
+                    )
+                    leg_q_target = leg_targets_from_action(
+                        action, default_dof, action_scale, clip_actions=clip_actions
+                    )
+                t_policy_pre = time.perf_counter()
+
+                if z1_writer is not None:
+                    z1_writer.send(
+                        gripper_q=robot.gripper_q,
+                        robot=robot,
+                        vr_goal=vr_goal,
+                        obs_builder=obs_builder,
+                        phase_variable=obs_pack["phase_variable"],
+                    )
+                t_arm = time.perf_counter()
+
+                _maybe_publish_ee(
+                    ee_goal_publisher,
+                    obs_pack,
+                    None if z1_writer is None else z1_writer.gripper_command(),
+                    z1_writer=z1_writer,
+                )
+                if args.execute_actions and lowcmd_writer is not None:
+                    lowcmd_writer.set_leg_targets(leg_q_target)
+
+                work_ms = (time.perf_counter() - t0) * 1000.0
+                stages_ms = {
+                    "read": (t_read - t0) * 1000.0,
+                    "obs": (t_obs - t_read) * 1000.0,
+                    "policy": (t_policy_pre - t_obs) * 1000.0,
+                    "arm": (t_arm - t_policy_pre) * 1000.0,
+                }
+                teleop_ms = work_ms
+
+            if teleop_ms >= max_work_ms:
+                max_work_ms = teleop_ms
+                max_stages_ms = dict(stages_ms)
+            if z1_writer is not None:
+                # For arm-only, loop_ms = arm-critical path (read+arm), not obs.
+                z1_writer._last_status["loop_ms"] = (
+                    teleop_ms if args.arm_only else work_ms
+                )
+
+            # Cap print rate: at most 1 Hz for status (do_print computed pre-build).
+            if do_print:
+                if args.verbose or not args.arm_only:
+                    print_obs_summary(
+                        step,
+                        obs_pack,
+                        action,
+                        use_cmd=bool(
+                            obs_builder.use_cmd or config["commands"].get("use_cmd")
+                        ),
+                    )
+                    if args.arm_only:
+                        print("  leg_cmd        : sport mode (no lowcmd; --arm-only)")
+                        print(
+                            "  policy         : process-worker "
+                            f"(last_infer={policy_stage_ms:.2f}ms, legs not applied)"
+                        )
+                    elif args.execute_actions and not apply_policy:
+                        print(
+                            "  leg_cmd        : holding init_deploy_joint "
+                            "(policy not applied)"
+                        )
+                if z1_writer is not None:
                     print(f"  arm_teleop     : {z1_writer.status_line()}")
+                    # Arm-only: overrun = read+arm only (obs runs after arm now).
+                    overrun = step > 0 and max_work_ms > dt * 1000.0 * 1.5
+                    if overrun:
+                        rss_mb = _resource.getrusage(
+                            _resource.RUSAGE_SELF
+                        ).ru_maxrss / 1024.0
+                        ik_ms = float(z1_writer._last_status.get("arm_ik_ms") or 0.0)
+                        cmd_ms = float(z1_writer._last_status.get("arm_cmd_ms") or 0.0)
+                        print(
+                            f"  arm_lag_hint   : arm_crit now={teleop_ms:.0f}ms "
+                            f"max={max_work_ms:.0f}ms > dt={dt*1000.0:.0f}ms "
+                            f"(read={max_stages_ms.get('read', 0):.1f} "
+                            f"arm={max_stages_ms.get('arm', 0):.1f} "
+                            f"ik={ik_ms:.1f} cmd={cmd_ms:.1f} | "
+                            f"obs_after={max_stages_ms.get('obs', 0):.1f} ms) "
+                            f"rss={rss_mb:.0f}MB."
+                        )
+                        now_t = time.perf_counter()
+                        if async_policy is not None and now_t - _last_lag_note_t >= 5.0:
+                            _last_lag_note_t = now_t
+                            print(
+                                f"  policy_timing  : wall={async_policy.last_infer_ms:.2f}ms "
+                                f"cpu={async_policy.last_cpu_ms:.2f}ms "
+                                f"wait={async_policy.last_wait_ms:.2f}ms "
+                                f"(child process; should not block arm)."
+                            )
+                    max_work_ms = 0.0
+                    max_stages_ms = {}
+                    mode = z1_writer._last_status.get("mode")
+                    if mode == "hold_no_vr":
+                        print(
+                            "  arm_stuck_hint: VR connected=False or Tdes=None "
+                            "(tracker/websocket)."
+                        )
+                    elif mode == "tdes_pos_only":
+                        print(
+                            "  arm_note       : full-pose hasIK=False; tracking "
+                            "position only (keep current EE orientation)."
+                        )
+                    elif mode == "tdes_inc_pos":
+                        print(
+                            "  arm_note       : full+pos IK failed; incremental "
+                            "on position-only target."
+                        )
                 if hotkeys is not None and hotkeys.enable_vel:
                     print(
                         f"  keyboard_cmd   : "
@@ -1044,15 +1356,15 @@ def main() -> None:
                         f"yaw={obs_builder.commands[2]:.2f}"
                     )
 
-            if args.execute_actions and not args.arm_only and lowcmd_writer is not None:
-                lowcmd_writer.set_leg_targets(leg_q_target)
-
             step += 1
             _sleep_dt(dt - (time.perf_counter() - t0), shutdown)
     except KeyboardInterrupt:
         shutdown["stop"] = True
         print("\nStopped.")
     finally:
+        _gc.enable()
+        if async_policy is not None:
+            async_policy.stop()
         if hotkeys is not None:
             hotkeys.stop()
         if z1_writer is not None:

@@ -64,7 +64,7 @@ def _parse_args() -> argparse.Namespace:
         nargs=3,
         metavar=("X", "Y", "Z"),
         default=None,
-        help="Arm-base mount xyz in robot base (default: 0.15 0 0.10)",
+        help="Arm-base mount xyz in robot base (default: 0.03 0 0.09)",
     )
     p.add_argument(
         "--recordings-root",

@@ -94,7 +94,10 @@ class B2StateReader:
         if base_quat[0] == 0.0 and np.allclose(base_quat[1:], 0.0):
             base_quat = np.array([1.0, 0.0, 0.0, 0.0])
 
-        gyro = np.array(imu.gyroscope, dtype=np.float64)
+        # Unitree IMU gyroscope is already body-frame ω (rad/s). Training uses
+        # quat_rotate_inverse(base_quat, root_ω_world), which is also body-frame.
+        # Do NOT rotate the IMU gyro again (that would double-apply R^{-1}).
+        gyro_body = np.array(imu.gyroscope, dtype=np.float64)
         leg_q_motor = np.array([low.motor_state[i].q for i in range(12)], dtype=np.float64)
         leg_dq_motor = np.array([low.motor_state[i].dq for i in range(12)], dtype=np.float64)
         leg_q = motor_legs_to_sim(leg_q_motor)
@@ -109,11 +112,9 @@ class B2StateReader:
         # base frame (origin at base). Sport velocity is still used for twist.
         if sport is not None:
             base_lin_vel_world = np.array(sport.velocity, dtype=np.float64)
-            if abs(sport.yaw_speed) > 1e-8:
-                gyro[2] = float(sport.yaw_speed)
 
         base_lin_vel_local = quat_rotate_inverse_np(base_quat, base_lin_vel_world)
-        base_ang_vel_local = quat_rotate_inverse_np(base_quat, gyro)
+        base_ang_vel_local = gyro_body.copy()
         projected_gravity = quat_rotate_inverse_np(base_quat, np.array([0.0, 0.0, -1.0]))
 
         return {
@@ -121,7 +122,7 @@ class B2StateReader:
             "base_quat": base_quat,
             "base_pos": base_pos,
             "base_lin_vel_world": base_lin_vel_world,
-            "base_ang_vel_world": gyro,
+            "base_ang_vel_world": gyro_body,  # name kept; value is body-frame IMU ω
             "base_lin_vel_local": base_lin_vel_local,
             "base_ang_vel_local": base_ang_vel_local,
             "leg_q": leg_q,

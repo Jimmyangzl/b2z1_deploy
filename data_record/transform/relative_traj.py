@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-DEFAULT_ARM_BASE_OFFSET = np.array([0.15, 0.0, 0.10], dtype=np.float64)
+DEFAULT_ARM_BASE_OFFSET = np.array([0.03, 0.0, 0.09], dtype=np.float64)
 
 # Fields that must be fully finite before transforming.
 _NAN_GATE_FIELDS = (

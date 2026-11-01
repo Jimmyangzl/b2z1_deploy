@@ -75,7 +75,10 @@ def main() -> None:
             action = None
             if policy is not None:
                 action = run_policy(policy, obs_pack["obs_vector"])
-                obs_builder.update_action_history(action)
+                clip_a = float(config.get("control", {}).get("clip_actions", 20.0))
+                action = obs_builder.update_action_history(
+                    action, clip_actions=clip_a
+                )
 
             if args.verbose:
                 print(f"\n=== step {step} FULL OBS ===")

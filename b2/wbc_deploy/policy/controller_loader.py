@@ -17,7 +17,23 @@ from rsl_rl.modules import ActorCritic
 
 from policy.constants import history_len, num_actions, num_observations, num_priv, num_proprio
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Default for imports / scripts that do not pass an explicit device. Deploy
+# overrides this via policy.device in yaml (cpu by default — see b2z1_wbc.yaml).
+device = torch.device("cpu")
+
+
+def resolve_torch_device(spec) -> torch.device:
+    """Map 'cpu' / 'cuda' / 'cuda:0' / torch.device → torch.device."""
+    if isinstance(spec, torch.device):
+        return spec
+    text = str(spec or "cpu").strip().lower()
+    if text == "cuda" or text.startswith("cuda:"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"policy device '{text}' requested but CUDA is unavailable")
+        return torch.device(text)
+    if text == "cpu":
+        return torch.device("cpu")
+    raise ValueError(f"Unsupported policy device '{spec}' (use cpu or cuda)")
 
 
 class BaseConfig:

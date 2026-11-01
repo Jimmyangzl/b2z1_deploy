@@ -1,6 +1,6 @@
 """Build WBC observation vector matching teleop_task / controller_loader layout."""
 
-from typing import Any, Dict, TYPE_CHECKING
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
 import math
 
@@ -36,8 +36,9 @@ class ObservationBuilder:
         self.lin_vel_scale = float(obs_cfg["lin_vel_scale"])
         self.ang_vel_scale = float(obs_cfg["ang_vel_scale"])
         self.dof_vel_scale = float(obs_cfg["dof_vel_scale"])
+        self.clip_observations = float(obs_cfg.get("clip_observations", 100.0))
         self.z1_base_in_robot_base = np.array(robot_cfg["z1_base_in_robot_base"], dtype=np.float64)
-        policy_arm_base = robot_cfg.get("policy_arm_base_offset", [0.15, 0.0, 0.10])
+        policy_arm_base = robot_cfg.get("policy_arm_base_offset", [0.03, 0.0, 0.09])
         self.policy_arm_base_offset = np.array(policy_arm_base, dtype=np.float64)
         # When True, last_leg_actions in proprio stay zero (breaks action feedback; use for --no-vr standing test).
         self.suppress_last_leg_actions = False
@@ -60,7 +61,10 @@ class ObservationBuilder:
         self.ang_vel_yaw_clip = float(cmd_cfg.get("ang_vel_yaw_clip", 0.05))
 
         rfm_cfg = config.get("rfm", {})
-        self.dvel_xy_amp = float(rfm_cfg.get("dvel_xy_amp", 0.15))
+        # Per-axis XY amps; fall back to legacy dvel_xy_amp then 0.15.
+        _xy_legacy = float(rfm_cfg.get("dvel_xy_amp", 0.15))
+        self.dvel_x_amp = float(rfm_cfg.get("dvel_x_amp", _xy_legacy))
+        self.dvel_y_amp = float(rfm_cfg.get("dvel_y_amp", _xy_legacy))
         self.dvel_yaw_amp = float(rfm_cfg.get("dvel_yaw_amp", 0.4))
 
         angles = robot_cfg["default_joint_angles"]
@@ -74,6 +78,7 @@ class ObservationBuilder:
         self.dvel_b_local = np.zeros(3, dtype=np.float64)
         self.dpos_b_local = np.zeros(3, dtype=np.float64)
         self.phase_variable = 0.0
+        self.dist_base_ee = 0.0
         self.privileged_obs = np.zeros(num_priv, dtype=np.float64)
 
     def set_commands(self, vx: float, vy: float, yaw: float) -> None:
@@ -90,13 +95,30 @@ class ObservationBuilder:
         self.dvel_b_local[:] = 0.0
         self.dpos_b_local[:] = 0.0
         self.phase_variable = 0.0
+        self.dist_base_ee = 0.0
         self.gait_clock.gait_indices[:] = 0.0
         self.gait_clock.clock_inputs[:] = 0.0
         self.manip = ManipulabilityTracker()
 
-    def update_action_history(self, action: np.ndarray) -> None:
-        leg = np.asarray(action, dtype=np.float64).reshape(-1)[:12]
-        self.action_history_buf = np.vstack([self.action_history_buf[1:], leg.reshape(1, -1)])
+    def update_action_history(
+        self,
+        action: np.ndarray,
+        *,
+        clip_actions: Optional[float] = None,
+    ) -> np.ndarray:
+        """Push leg actions into history (matches training: clip before store).
+
+        Returns the (possibly clipped) 12-dim vector that was stored / should be
+        used for motor targets so obs feedback stays consistent.
+        """
+        leg = np.asarray(action, dtype=np.float64).reshape(-1)[:12].copy()
+        if clip_actions is not None and float(clip_actions) > 0.0:
+            c = float(clip_actions)
+            leg = np.clip(leg, -c, c)
+        self.action_history_buf = np.vstack(
+            [self.action_history_buf[1:], leg.reshape(1, -1)]
+        )
+        return leg
 
     @staticmethod
     def get_body_rp(base_quat: np.ndarray) -> np.ndarray:
@@ -110,7 +132,12 @@ class ObservationBuilder:
         return quat_rotate_inverse_np(base_yaw_quat, pos_aligned)
 
     def _ee_goal_local_cart(self, goal_base: np.ndarray) -> np.ndarray:
-        """EE goal in arm-base frame (mount origin; axes = B2/arm, rpy=0 mount)."""
+        """EE goal in arm-base frame (mount origin; axes = B2/arm, rpy=0 mount).
+
+        ``goal_base`` is robot-base (mount + arm). Matches training
+        ``quat_rotate_inverse(base_quat, goal_world - arm_base_pos)`` when the
+        mount has zero RPY (translation-only).
+        """
         return np.asarray(goal_base, dtype=np.float64) - self.policy_arm_base_offset
 
     def _update_rfm_state(
@@ -122,10 +149,10 @@ class ObservationBuilder:
         """Build phase_variable and dvel_b_local to match Isaac arm_control RFM.
 
         dvel (when VR active):
-          xy = dvel_xy_amp * unit(goal in base_yaw xy)
+          xy = (dvel_x_amp, dvel_y_amp) * unit(goal in base_yaw xy)
           yaw = dvel_yaw_amp * sign(goal_yaw - base_yaw)
         masks (same as arm_control.update_rfm_state):
-          mask_xy:   (manip_pred > 1e-3 or dist(ee, mount)_xy < 0.55) and phase < 0.5
+          mask_xy:   (manip_pred > 1e-3 or dist(ee, mount)_xy < 0.6) and phase < 0.5
                      → zero xy
           mask_back: manip_pred < 5e-4 and dist(ee, mount)_xy < 0.1 and phase < 0.5
                      → flip xy
@@ -145,8 +172,10 @@ class ObservationBuilder:
         # Goal relative to base origin in base_yaw (sim: R_yaw^{-1}(goal_world - base_pos)).
         self.dpos_b_local = goal_yaw_pos.copy()
         dvel_norm = float(np.linalg.norm(self.dpos_b_local[:2]))
-        if dvel_norm > 1e-8:
-            self.dvel_b_local[:2] = self.dvel_xy_amp * self.dpos_b_local[:2] / dvel_norm
+        if dvel_norm > 1e-3:
+            unit_xy = self.dpos_b_local[:2] / dvel_norm
+            self.dvel_b_local[0] = self.dvel_x_amp * float(unit_xy[0])
+            self.dvel_b_local[1] = self.dvel_y_amp * float(unit_xy[1])
         else:
             self.dvel_b_local[:2] = 0.0
 
@@ -169,14 +198,14 @@ class ObservationBuilder:
 
         # Train (base_sample=False): mount = R_yaw @ offset → offset in yaw frame.
         arm_mount_yaw = np.asarray(self.policy_arm_base_offset, dtype=np.float64)
-        dist_base_ee = float(np.linalg.norm((ee_yaw - arm_mount_yaw)[:2]))
+        self.dist_base_ee = float(np.linalg.norm((ee_yaw - arm_mount_yaw)[:2]))
         mask_xy = (
-            (manip_pred_last > 0.001) or (dist_base_ee < 0.55)
+            (manip_pred_last > 0.001) or (self.dist_base_ee < 0.6)
         ) and (self.phase_variable < 0.5)
         mask_yaw = ee_euler_error > 0.785
         mask_back = (
             (manip_pred_last < 0.0005)
-            and (dist_base_ee < 0.1)
+            and (self.dist_base_ee < 0.1)
             and (self.phase_variable < 0.5)
         )
 
@@ -222,6 +251,8 @@ class ObservationBuilder:
         self,
         robot: RobotState,
         vr_goal: "VrGoalProvider",
+        *,
+        debug: bool = True,
     ) -> Dict[str, Any]:
         self.episode_length_buf += 1
 
@@ -251,8 +282,6 @@ class ObservationBuilder:
         else:
             ee_pos = np.full(3, np.nan, dtype=np.float64)
             ee_quat = np.full(4, np.nan, dtype=np.float64)
-        # ee_goal_local_cart[0] = 0.4 
-        # ee_goal_local_cart[2] = 0.4 
 
         locomotion_obs = self._locomotion_obs()
         gait_indices, clock_inputs = self.gait_clock.step(
@@ -294,40 +323,55 @@ class ObservationBuilder:
         )
         assert proprio.shape[0] == num_proprio, f"proprio dim {proprio.shape[0]} != {num_proprio}"
 
+        # In-place history roll — avoid allocate-on-every-tick concatenate/stack.
         if self.episode_length_buf <= 1:
-            self.obs_history_buf = np.stack([proprio] * history_len, axis=0)
+            self.obs_history_buf[:] = proprio
         else:
-            self.obs_history_buf = np.concatenate(
-                [self.obs_history_buf[1:], proprio[np.newaxis, :]], axis=0,
-            )
+            self.obs_history_buf[:-1] = self.obs_history_buf[1:]
+            self.obs_history_buf[-1] = proprio
 
         history_flat = self.obs_history_buf.reshape(-1)
+        # History stores unclipped proprio (same as train); clip only the policy vector.
         obs_vector = np.concatenate([proprio, self.privileged_obs, history_flat])
+        if self.clip_observations > 0.0:
+            c = float(self.clip_observations)
+            obs_vector = np.clip(obs_vector, -c, c)
 
-        slices = self._named_slices(proprio)
-        return {
-            "obs_vector": obs_vector.astype(np.float64),
-            "proprio": proprio,
-            "privileged": self.privileged_obs.copy(),
-            "history": history_flat,
-            "slices": slices,
+        # Hot path (50 Hz): only what control + policy need. Debug copies/slices
+        # are built on print ticks only — otherwise RAM grows for minutes then
+        # the process starts stalling (wait≫cpu) after a long healthy stretch.
+        out: Dict[str, Any] = {
+            "obs_vector": obs_vector,
             "ee_goal_local_cart": ee_goal_local_cart,
-            "ee_goal_quat_base": np.asarray(goal_quat_base, dtype=np.float64).reshape(4).copy(),
-            "ee_pos": np.asarray(ee_pos, dtype=np.float64).reshape(3).copy(),
-            "ee_quat": np.asarray(ee_quat, dtype=np.float64).reshape(4).copy(),
-            "base_lin_vel": np.asarray(base_lin_vel, dtype=np.float64).copy(),
-            "ee_goal_base": goal_base,
-            "ee_goal_world": goal_base,  # back-compat alias (base frame, not sport world)
-            "dvel_b_local": self.dvel_b_local.copy(),
-            "commands": self.commands.copy(),
-            "locomotion_obs": locomotion_obs.copy(),
-            "use_cmd": self.use_cmd,
+            "ee_goal_quat_base": np.asarray(goal_quat_base, dtype=np.float64).reshape(4),
             "phase_variable": self.phase_variable,
-            "manip_det": manip_det,
-            "manip_det_pred": self.manip.manip_det_pred.copy(),
-            "gait_indices": gait_indices,
-            "clock_inputs": clock_inputs,
+            "use_cmd": self.use_cmd,
+            "commands": self.commands,
+            "dvel_b_local": self.dvel_b_local,
         }
+        if not debug:
+            return out
+
+        out.update(
+            {
+                "proprio": proprio,
+                "privileged": self.privileged_obs.copy(),
+                "history": history_flat,
+                "slices": self._named_slices(proprio),
+                "ee_pos": np.asarray(ee_pos, dtype=np.float64).reshape(3).copy(),
+                "ee_quat": np.asarray(ee_quat, dtype=np.float64).reshape(4).copy(),
+                "base_lin_vel": np.asarray(base_lin_vel, dtype=np.float64).copy(),
+                "ee_goal_base": goal_base,
+                "ee_goal_world": goal_base,
+                "locomotion_obs": locomotion_obs.copy(),
+                "dist_base_ee": self.dist_base_ee,
+                "manip_det": manip_det,
+                "manip_det_pred": self.manip.manip_det_pred.copy(),
+                "gait_indices": gait_indices,
+                "clock_inputs": clock_inputs,
+            }
+        )
+        return out
 
     def _named_slices(self, proprio: np.ndarray) -> Dict[str, np.ndarray]:
         idx = 0

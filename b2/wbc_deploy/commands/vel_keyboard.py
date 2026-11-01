@@ -147,10 +147,8 @@ class DeployHotkeys:
             self.yaw = 0.0
         else:
             return
-        print(
-            f"[hotkeys] cmd vx={self.vx:.2f} vy={self.vy:.2f} yaw={self.yaw:.2f}",
-            flush=True,
-        )
+        # No print/flush on this thread — TTY I/O + GIL stalls the control loop.
+        # Velocity is shown on the main loop's 1 Hz keyboard_cmd status line.
         self._notify_vel()
 
     def _setup_terminal(self) -> None:

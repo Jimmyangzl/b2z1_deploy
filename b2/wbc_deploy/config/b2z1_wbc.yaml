@@ -16,7 +16,7 @@ control:
   # kd: [10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10]
   # High gains for the initial hold after sport release (see b2_stand_example: Kp=1000).
   # Same scalar-or-12-list convention as kp/kd.
-  startup_kp: 500.0
+  startup_kp: 1000.0
   startup_kd: 10.0
   # Legs only (policy outputs 12); arm pose via IK on the robot.
   action_scale: [0.4, 0.45, 0.45, 0.4, 0.45, 0.45, 0.4, 0.45, 0.45, 0.4, 0.45, 0.45]
@@ -40,7 +40,7 @@ control:
     RR_calf_joint: [-2.82, -1.0]
     z1_waist: [-2.5, 2.5]
     z1_shoulder: [0.0, 2.8]
-    z1_elbow: [-2.5, 0.0]
+    z1_elbow: [-2.8, 0.0]
     z1_wrist_angle: [-1.5, 1.5]
     z1_forearm_roll: [-1.5, 1.5]
     z1_wrist_rotate: [-2.5, 2.5]
@@ -66,11 +66,13 @@ observation:
   ang_vel_scale: 1.0
   dof_vel_scale: 0.05
   foot_contact_threshold: 440.0
+  # Match training normalization.clip_observations (applied to policy obs_vector).
+  clip_observations: 100.0
 
 robot:
   # Arm mount from URDF fixed joint base_static_joint (overrides any hardcoded offset).
   urdf: urdf/b2z1.urdf
-  # Filled at load time from urdf (currently xyz="0.15 0 0.10").
+  # Filled at load time from urdf (currently xyz="0.03 0 0.09").
   # policy_arm_base_offset / z1_base_in_robot_base are set in load_config().
   gravity_vec: [0.0, 0.0, -1.0]
   default_joint_angles:
@@ -94,7 +96,7 @@ vr:
   port: 8765
 
 gait:
-  frequencies: 2.0
+  frequencies: 1.0
   phases: 0.5
   offsets: 0.0
   bounds: 0.0
@@ -107,14 +109,17 @@ commands:
   cmd_vx: 0.0
   cmd_vy: 0.0
   cmd_yaw: 0.0
-  lin_vel_x_clip: 0.1
-  lin_vel_y_clip: 0.1
+  lin_vel_x_clip: 0.05
+  lin_vel_y_clip: 0.05
   ang_vel_yaw_clip: 0.2
 
-# RFM locomotion (use_cmd: false). Matches b2z1_lambdawbc_config.experiment.dvel_xy_amp.
+# RFM locomotion (use_cmd: false). Per-axis XY speed amps [m/s] along unit(goal_xy).
 rfm:
-  dvel_xy_amp: 0.15
+  dvel_x_amp: 0.1
+  dvel_y_amp: 0.08
   dvel_yaw_amp: 0.4
+  # Legacy single amp (used only if dvel_x_amp / dvel_y_amp omitted):
+  # dvel_xy_amp: 0.15
 
 # Optional EE-goal stream for data_record (enabled with --ee-goal-ws).
 streaming:
@@ -129,6 +134,13 @@ policy:
   # checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy/model_48000.pt
   # checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy/model_100000.pt
   # checkpoint: null
+  # Inference device. Default cpu: this actor is a tiny batch-1 MLP (~0.3 ms CPU).
+  # cuda shares the laptop dGPU with SteamVR → intermittent 100–300 ms stalls.
+  device: cpu
+  # Cap Torch + OpenBLAS/OpenMP to this many threads (1 required for 50 Hz RT).
+  # Leaving defaults (OpenBLAS≈32, GOMP≈24) oversubscribes next to SteamVR and
+  # makes run_policy wall-clock look like 100–300 ms even though flops are <1 ms.
+  num_threads: 1
 
 
 # Keyboard teleop magnitudes when --vel_keyboard is set (m/s, rad/s).
@@ -152,32 +164,27 @@ init_deploy_joint:
   # RL: [0.17,  0.6, -1.6]
   # RR: [0.1,  0.9, -1.8]
 
-  # FL: [0.0839,  0.800, -1.66]
-  # FR: [-0.16, 0.939, -1.52]
-  # RL: [0.078,  0.58, -1.57]
-  # RR: [0.0104,  0.6, -1.59]
-  # FL: [-4.2240e-02,  8.7309e-01, -1.6837e+00]
-  # FR: [-2.9564e-02,  6.6050e-01, -1.7029e+00]
-  # RL: [7.5277e-02,  6.2199e-01, -1.6643e+00]
-  # RR: [-3.0443e-01, 6.6166e-01, -1.6479e+00]
 
-  # FL: [6.1352e-03,  7.3719e-01, -1.6395e+00]
-  # FR: [-7.9851e-03,  7.8602e-01, -1.6028e+00]
-  # RL: [-2.5622e-02,  7.2960e-01, -1.5496e+00]
-  # RR: [1.4613e-01,  8.4543e-01, -1.5455e+00]
+  # FL: [2.2980e-02,  6.9664e-01, -1.6319e+00]
+  # FR: [9.0408e-02,  6.8347e-01, -1.6360e+00]
+  # RL: [1.1369e-02,  6.6347e-01, -1.4966e+00,]
+  # RR: [-3.3321e-02,  7.0714e-01, -1.4326e+00]
 
-  # FL: [5.1990e-02,  7.5517e-01, -1.5543e+00]
-  # FR: [1.7152e-01,  7.9700e-01, -1.6008e+00]
-  # RL: [3.2238e-02,  7.3613e-01, -1.5858e+00]
-  # RR: [8.9729e-02,  8.3601e-01, -1.6023e+00]
+  # FL: [-4.3536e-02,  4.9689e-01, -1.7700e+00]
+  # FR: [7.3769e-02,  3.9787e-01, -1.7795e+00]
+  # RL: [-1.8644e-02,  3.5985e-01, -1.1335e+00]
+  # RR: [1.3925e-02,  4.0896e-01, -1.1811e+00]
 
-  FL: [2.2980e-02,  6.9664e-01, -1.6319e+00]
-  FR: [9.0408e-02,  6.8347e-01, -1.6360e+00]
-  RL: [1.1369e-02,  6.6347e-01, -1.4966e+00,]
-  RR: [-3.3321e-02,  7.0714e-01, -1.4326e+00]
+  # FL: [3.2037e-02,  6.2553e-01, -1.2391e+00]
+  # FR: [2.9064e-02,  6.3741e-01, -1.3059e+00]
+  # RL: [-1.6031e-02,  7.4089e-01, -1.0673e+00]
+  # RR: [-1.8513e-02,  6.4971e-01, -1.1550e+00]
 
-         
-                
+  FL: [-2.1523e-02,  7.2177e-01, -1.3489e+00]
+  FR: [5.2327e-03,  6.2886e-01, -1.2872e+00]
+  RL: [-8.9532e-03,  7.7619e-01, -1.0553e+00]
+  RR: [-4.2915e-03,  6.6486e-01, -1.0597e+00]
+
 
 init_deploy_ramp_s: 5.0
 init_deploy_hold_s: 2.0

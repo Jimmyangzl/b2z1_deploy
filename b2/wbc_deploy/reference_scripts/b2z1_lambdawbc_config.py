@@ -46,9 +46,11 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
         base_sample_default_ratio = 0.2 # 0.2
         # World-frame EE height limits for base_sample goals [m].
         base_sample_z_range = [0.35, 0.8]
-        # RFM dvel_b_local XY amplitude [m/s] (unit direction × amp). Far goals use the larger value.
-        dvel_xy_amp = 0.15
-        dvel_xy_amp_far = 0.3
+        # RFM dvel_b_local amplitudes [m/s]: unit(dpos_xy) scaled per axis. Far goals use *_far.
+        dvel_x_amp = 0.1
+        dvel_y_amp = 0.08
+        dvel_x_amp_far = 0.3
+        dvel_y_amp_far = 0.3
         far_sample = False
         fine_sample = False
         # Probabilities for SPHERE / BACK / ROT when fine_sample is on (need not sum to 1; normalized at use).
@@ -77,12 +79,12 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
 
         class sphere_center:
             # x_offset = 0.3 # Relative to base
-            x_offset = 0.15 # Relative to base
-            # x_offset = 0.0
+            # x_offset = 0.15 # Relative to base
+            x_offset = 0.03
             # x_offset = 0.35 # Relative to base
             y_offset = 0 # Relative to base
             # z_invariant_offset = 0.7 # Relative to terrain
-            z_invariant_offset = 0.7
+            z_invariant_offset = 0.5
 
         class ranges:
             init_pos_start = [0.5, np.pi/8, 0]
@@ -94,8 +96,8 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
             # pos_l = [0.7, 1.5]
             # pos_l = [1., 3.0]
             # pos_p = [-1 * np.pi / 2.5, 1 * np.pi / 3]
-            pos_p = [-1 * np.pi / 6, 1 * np.pi / 12]
-            pos_y = [-np.pi/3 - 0.2, np.pi/3 + 0.2]
+            pos_p = [-1 * np.pi / 6, 1 * np.pi / 6]
+            pos_y = [-((np.pi/3) + 0.2), (np.pi/3) + 0.2]
             # pos_y = [-2*np.pi/3, 2*np.pi/3] # 3*np.pi/5
             # pos_y = [-np.pi/3.0, np.pi/3.0]
 
@@ -108,7 +110,8 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
             
             delta_orn_r = [-0.5, 0.5]
             # delta_orn_p = [-0.5, 0.5]
-            delta_orn_p = [-0.1, 0.3]
+            # delta_orn_p = [-0.1, 0.3]
+            delta_orn_p = [0.0, 1.0]
             delta_orn_y = [-0.5, 0.5]
 
             final_tracking_ee_reward = 0.55
@@ -139,19 +142,22 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
         # tracking_ang_vel_yaw_schedule = [0, 1]
 
         # ang_vel_yaw_clip = 0.5
-        # lin_vel_x_clip = 0.8
-        # lin_vel_y_clip = 0.8
         ang_vel_yaw_clip = 0.2
-        lin_vel_x_clip = 0.1
-        lin_vel_y_clip = 0.1
-        lin_vel_clip = 0.1
+        lin_vel_x_clip = 0.05
+        lin_vel_y_clip = 0.05
+        lin_vel_clip = 0.05
+        # lin_vel_x_clip = 0.035
+        # lin_vel_y_clip = 0.035
+        # lin_vel_clip = 0.035
 
         class ranges:
             # lin_vel_x = [-0.8, 0.8] # min max [m/s]
             # lin_vel_y = [-0.8, 0.8] # min max [m/s]
             # ang_vel_yaw = [-1.0, 1.0]    # min max [rad/s]
-            lin_vel_x = [-0.3, 0.3] # min max [m/s]
-            lin_vel_y = [-0.3, 0.3] # min max [m/s]
+            lin_vel_x = [-0.15, 0.15] # min max [m/s]
+            lin_vel_y = [-0.15, 0.15] # min max [m/s]
+            # lin_vel_x = [-0.1, 0.1] # min max [m/s]
+            # lin_vel_y = [-0.1, 0.1] # min max [m/s]
             ang_vel_yaw = [-0.5, 0.5]    # min max [rad/s]
 
     class normalization:
@@ -181,13 +187,14 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
         num_observations = num_proprio * (history_len+1) + num_priv
         num_privileged_obs = None # if not None a priviledge_obs_buf will be returned by step() (critic obs for assymetric training). None is returned otherwise 
         send_timeouts = True # send time out information to the algorithm
-        episode_length_s = 20 # episode length in seconds
+        episode_length_s = 30 # episode length in seconds
         reorder_dofs = False
         teleop_mode = False # Overriden in teleop.py. When true, commands come from keyboard
         record_video = False
         stand_by = False
         observe_gait_commands = True
-        frequencies = 2
+        # frequencies = 2
+        frequencies = 1
         
     class init_state( LeggedRobotCfg.init_state ):
         pos = [0.0, 0.0, 0.55] # x,y,z [m]
@@ -296,7 +303,7 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
             # 'z1_shoulder': (0.0, 3.141592653589793),
             'z1_shoulder': (0.0, 2.8),
             # 'z1_elbow': (-3.0, 0.0),
-            'z1_elbow': (-2.5, 0.0),
+            'z1_elbow': (-2.8, 0.0),
             # 'z1_wrist_angle': (-1.7453292519943295, 1.5707963267948966),
             'z1_wrist_angle': (-1.5, 1.5),
             # 'z1_forearm_roll': (-1.7278759594743864, 1.7278759594743864),
@@ -365,9 +372,10 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
         observe_priv = True
         # observe_priv = False
         randomize_friction = True
-        friction_range = [0.4, 1.5] # [0.5, 3.0]
+        friction_range = [0.5, 2.0] # [0.5, 3.0]
         randomize_base_mass = True
-        added_mass_range = [0., 15.]
+        # added_mass_range = [0., 15.]
+        added_mass_range = [-2.0, 5.0]
         randomize_base_com = True
         # added_com_range_x = [-0.15, 0.15]
         # added_com_range_y = [-0.15, 0.15]
@@ -376,14 +384,15 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
         added_com_range_y = [-0.03, 0.03]
         added_com_range_z = [-0.02, 0.02]
         randomize_motor = True
-        leg_motor_strength_range = [0.7, 1.3]
-        arm_motor_strength_range = [0.7, 1.3]
+        # leg_motor_strength_range = [0.7, 1.3]
+        # arm_motor_strength_range = [0.7, 1.3]
+        leg_motor_strength_range = [0.8, 1.2]
+        arm_motor_strength_range = [0.8, 1.2]
         randomize_gripper_mass = True
-        # gripper_added_mass_range = [0, 0.1]
-        gripper_added_mass_range = [0, 2.0]
+        gripper_added_mass_range = [0, 1.5]
         push_robots = True
         push_interval_s = 5
-        max_push_vel_xy = 0.5
+        max_push_vel_xy = 0.2
   
     class rewards:
         reward_container_name = "maniploco_rewards"   # select the reward container to use
@@ -402,7 +411,8 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
         gait_force_sigma = 0.5
         kappa_gait_probs = 0.07
         # feet_height_target = 0.3
-        feet_height_target = 0.05
+        # feet_height_target = 0.05
+        feet_height_target = 0.1
 
         feet_aritime_allfeet = True
         feet_height_allfeet = True
@@ -413,11 +423,10 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
             # -------Gait control rewards ---------
             # tracking_contacts_shaped_force = -4.0 # Only works when `observing_gait_commands` is true
             # tracking_contacts_shaped_vel = -4.0 # Only works when `observing_gait_commands` is true
-            tracking_contacts_shaped_force = 4.0 # Only works when `observing_gait_commands` is true
-            tracking_contacts_shaped_vel = 4.0 # Only works when `observing_gait_commands` is true
+            tracking_contacts_shaped_force = 2.0 # Only works when `observing_gait_commands` is true
+            tracking_contacts_shaped_vel = 2.0 # Only works when `observing_gait_commands` is true
             
-            feet_air_time = 2.0
-            # feet_air_time = 0.5
+            feet_air_time = None
             feet_height = 1.0
             # feet_height = 0.5
 
@@ -434,9 +443,11 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
             energy_square = None
             # torques = -2.5e-5 
             torques = -2.0e-5 
-            stand_still = 10.0
+            # stand_still = 10.0
+            stand_still = 5.0
             stand_still_vel = None
             # stand_still = None
+            # walking_dof = 5.0
             walking_dof = 2.0
             # walking_dof = None
             dof_default_pos = None
@@ -467,7 +478,7 @@ class B2Z1WBCRoughCfg( LeggedRobotCfg ):
             feet_jerk = None
             # feet_jerk = None
             # feet_drag = -0.08
-            feet_drag = -0.15
+            feet_drag = -0.5
             # feet_drag = None
             feet_contact_forces = -0.001
             # feet_contact_forces = None
@@ -613,8 +624,8 @@ class B2Z1WBCRoughCfgPPO(LeggedRobotCfgPPO):
         value_loss_coef = 1.0
         use_clipped_value_loss = True
         clip_param = 0.2
-        entropy_coef = 0.0
-        # entropy_coef = 0.01
+        # entropy_coef = 0.0
+        entropy_coef = 0.01
         num_learning_epochs = 5
         num_mini_batches = 4 # mini batch size = num_envs*nsteps / nminibatches
         learning_rate = 2e-4 

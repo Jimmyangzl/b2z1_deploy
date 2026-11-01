@@ -21,8 +21,10 @@
       <origin
         xyz="0.000458 0.005261 0.000665"
         rpy="0 0 0" />
+      <!--mass
+        value="35.86" />-->
       <mass
-        value="35.86" />
+        value="34.86" />
       <inertia
         ixx="0.27466"
         ixy="-0.000622"
@@ -1485,8 +1487,8 @@
   <!-- Start of Z1 Links and Joints -->
   <joint name="base_static_joint" type="fixed">
     <!-- <origin rpy="0 0 0" xyz="0.3 0 0.09" /> -->
-    <origin rpy="0 0 0" xyz="0.15 0 0.10" />
-    <!-- <origin rpy="0 0 0" xyz="0.0 0 0.09" /> -->
+    <!-- <origin rpy="0 0 0" xyz="0.15 0 0.10" /> -->
+    <origin rpy="0 0 0" xyz="0.03 0 0.09" />
     <parent link="base" />
     <child link="link00" />
   </joint>
@@ -1519,7 +1521,8 @@
     <child link="link01" />
     <axis xyz="0 0 1" />
     <dynamics damping="1.0" friction="1.0" />
-    <limit effort="30.0" lower="-2.6179938779914944" upper="2.6179938779914944" velocity="10" />
+    <!-- <limit effort="30.0" lower="-2.6179938779914944" upper="2.6179938779914944" velocity="10" /> -->
+    <limit effort="30.0" lower="-2.5" upper="2.5" velocity="10" />
   </joint>
   <link name="link01">
     <visual>
@@ -1543,6 +1546,7 @@
     <axis xyz="0 1 0" />
     <dynamics damping="2.0" friction="2.0" />
     <!-- <limit effort="60.0" lower="0.0" upper="3.141592653589793" velocity="10" /> -->
+    <!-- <limit effort="60.0" lower="0.0" upper="2.8" velocity="10" /> -->
     <limit effort="60.0" lower="0.0" upper="2.8" velocity="10" />
   </joint>
   <link name="link02">
@@ -1584,7 +1588,8 @@
     <child link="link03" />
     <axis xyz="0 1 0" />
     <dynamics damping="1.0" friction="1.0" />
-    <limit effort="30.0" lower="-3.0" upper="0.0" velocity="10" />
+    <!-- <limit effort="30.0" lower="-3.0" upper="0.0" velocity="10" /> -->
+    <limit effort="30.0" lower="-2.8" upper="0.0" velocity="10" />
   </joint>
   <link name="link03">
     <visual>
@@ -1619,7 +1624,8 @@
     <child link="link04" />
     <axis xyz="0 1 0" />
     <dynamics damping="1.0" friction="1.0" />
-    <limit effort="30.0" lower="-1.7453292519943295" upper="1.5707963267948966" velocity="10" />
+    <!-- <limit effort="30.0" lower="-1.7453292519943295" upper="1.5707963267948966" velocity="10" /> -->
+    <limit effort="30.0" lower="-1.5" upper="1.5" velocity="10" />
   </joint>
   <link name="link04">
     <visual>
@@ -1648,7 +1654,8 @@
     <child link="link05" />
     <axis xyz="0 0 1" />
     <dynamics damping="1.0" friction="1.0" />
-    <limit effort="30.0" lower="-1.7278759594743864" upper="1.7278759594743864" velocity="10" />
+    <!-- <limit effort="30.0" lower="-1.7278759594743864" upper="1.7278759594743864" velocity="10" /> -->
+    <limit effort="30.0" lower="-1.5" upper="1.5" velocity="10" />
   </joint>
   <link name="link05">
     <visual>
@@ -1671,7 +1678,8 @@
     <child link="link06" />
     <axis xyz="1 0 0" />
     <dynamics damping="1.0" friction="1.0" />
-    <limit effort="30.0" lower="-2.792526803190927" upper="2.792526803190927" velocity="10" />
+    <!-- <limit effort="30.0" lower="-2.792526803190927" upper="2.792526803190927" velocity="10" /> -->
+    <limit effort="30.0" lower="-2.5" upper="2.5" velocity="10" />
   </joint>
   <link name="link06">
     <visual>

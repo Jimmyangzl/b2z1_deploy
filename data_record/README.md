@@ -101,8 +101,8 @@ python scripts/make_relative_traj.py --task test --chunk-n 20 --episode 1
 # All episodes under recordings/<task>/:
 python scripts/make_relative_traj.py --task test --chunk-n 20
 
-# Optional arm-mount override (default 0.15 0 0.10):
-python scripts/make_relative_traj.py --task test --chunk-n 20 --arm-offset 0.15 0 0.10
+# Optional arm-mount override (default 0.03 0 0.09):
+python scripts/make_relative_traj.py --task test --chunk-n 20 --arm-offset 0.03 0 0.09
 ```
 
 Writes `recordings/relative_traj/<task>/episode_*.h5` (overwrites if present).
