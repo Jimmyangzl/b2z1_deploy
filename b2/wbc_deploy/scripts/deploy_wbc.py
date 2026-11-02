@@ -1162,6 +1162,9 @@ def main() -> None:
         "use_cmd": False,
         "commands": np.zeros(3),
         "dvel_b_local": np.zeros(3),
+        "base_lin_vel": np.zeros(3, dtype=np.float64),
+        "ee_pos": np.full(3, np.nan, dtype=np.float64),
+        "ee_quat": np.full(4, np.nan, dtype=np.float64),
     }
     try:
         while not shutdown["stop"]:
@@ -1210,13 +1213,26 @@ def main() -> None:
                     )
                     policy_stage_ms = float(async_policy.last_infer_ms)
 
-                if do_print:
-                    _maybe_publish_ee(
-                        ee_goal_publisher,
-                        obs_pack,
-                        None if z1_writer is None else z1_writer.gripper_command(),
-                        z1_writer=z1_writer,
-                    )
+                # Every tick: IK goal from z1_writer. Refresh vel/measured EE
+                # from robot (obs pack is only rebuilt at 1 Hz for prints).
+                pub_pack = obs_pack
+                if not do_print:
+                    pub_pack = dict(obs_pack)
+                    pub_pack["base_lin_vel"] = np.asarray(
+                        robot.base_lin_vel_local, dtype=np.float64
+                    ).copy()
+                    pub_pack["ee_pos"] = np.asarray(
+                        robot.ee_pos, dtype=np.float64
+                    ).reshape(3).copy()
+                    pub_pack["ee_quat"] = np.asarray(
+                        robot.ee_quat, dtype=np.float64
+                    ).reshape(4).copy()
+                _maybe_publish_ee(
+                    ee_goal_publisher,
+                    pub_pack,
+                    None if z1_writer is None else z1_writer.gripper_command(),
+                    z1_writer=z1_writer,
+                )
 
                 work_ms = (time.perf_counter() - t0) * 1000.0
                 stages_ms = {

@@ -337,9 +337,10 @@ class ObservationBuilder:
             c = float(self.clip_observations)
             obs_vector = np.clip(obs_vector, -c, c)
 
-        # Hot path (50 Hz): only what control + policy need. Debug copies/slices
-        # are built on print ticks only — otherwise RAM grows for minutes then
-        # the process starts stalling (wait≫cpu) after a long healthy stretch.
+        # Hot path (50 Hz): control + EE-WS fields. Debug copies/slices only on
+        # print ticks — otherwise RAM grows and the process stalls (wait≫cpu).
+        # base_lin_vel / ee_pos / ee_quat must stay here: deploy publishes them
+        # every tick; debug-only made the recorder see vel=[nan nan nan].
         out: Dict[str, Any] = {
             "obs_vector": obs_vector,
             "ee_goal_local_cart": ee_goal_local_cart,
@@ -348,6 +349,9 @@ class ObservationBuilder:
             "use_cmd": self.use_cmd,
             "commands": self.commands,
             "dvel_b_local": self.dvel_b_local,
+            "base_lin_vel": np.asarray(base_lin_vel, dtype=np.float64).copy(),
+            "ee_pos": np.asarray(ee_pos, dtype=np.float64).reshape(3).copy(),
+            "ee_quat": np.asarray(ee_quat, dtype=np.float64).reshape(4).copy(),
         }
         if not debug:
             return out
@@ -358,9 +362,6 @@ class ObservationBuilder:
                 "privileged": self.privileged_obs.copy(),
                 "history": history_flat,
                 "slices": self._named_slices(proprio),
-                "ee_pos": np.asarray(ee_pos, dtype=np.float64).reshape(3).copy(),
-                "ee_quat": np.asarray(ee_quat, dtype=np.float64).reshape(4).copy(),
-                "base_lin_vel": np.asarray(base_lin_vel, dtype=np.float64).copy(),
                 "ee_goal_base": goal_base,
                 "ee_goal_world": goal_base,
                 "locomotion_obs": locomotion_obs.copy(),
