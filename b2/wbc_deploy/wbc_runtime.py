@@ -235,7 +235,12 @@ def _wait_vr_prep_released(vr_goal, timeout_s: float = 15.0) -> None:
         )
 
 
-def load_runtime(args: argparse.Namespace, *, defer_release: bool = False):
+def load_runtime(
+    args: argparse.Namespace,
+    *,
+    defer_release: bool = False,
+    load_policy: bool = True,
+):
     config = load_config(args.config)
     if args.interface:
         config["network"]["interface"] = args.interface
@@ -267,6 +272,13 @@ def load_runtime(args: argparse.Namespace, *, defer_release: bool = False):
             host=config["vr"]["host"],
             port=int(config["vr"]["port"]),
             arm_mount_in_base=arm_mount,
+            use_process_client=True,
+        )
+        print(
+            "[load_runtime] VR websocket in child process "
+            f"(ws://{config['vr']['host']}:{int(config['vr']['port'])}; "
+            "own GIL, like ProcessPolicyWorker).",
+            flush=True,
         )
         vr_goal.start()
         _wait_vr_prep_released(vr_goal)
@@ -283,15 +295,16 @@ def load_runtime(args: argparse.Namespace, *, defer_release: bool = False):
         if not os.path.isfile(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-        # --arm-only runs policy in a child process; skip loading Torch in the
-        # teleop process (keeps GIL / OpenMP out of the 50 Hz arm path).
-        if getattr(args, "arm_only", False):
+        # Deploy uses ProcessPolicyWorker (own GIL). Skip Torch in the control
+        # process so inference cannot stall the 50 Hz loop.
+        skip_inprocess = (not load_policy) or getattr(args, "arm_only", False)
+        if skip_inprocess:
             print(
-                "[load_runtime] skip in-process policy load (--arm-only; "
-                "ProcessPolicyWorker child loads the checkpoint).",
+                "[load_runtime] skip in-process policy load "
+                "(ProcessPolicyWorker child loads the checkpoint).",
                 flush=True,
             )
-            # Cap BLAS only — do not import Torch into the teleop process.
+            # Cap BLAS only — do not import Torch into the control process.
             n = int((config.get("policy") or {}).get("num_threads", 1) or 1)
             configure_blas_threadpools(n)
         else:
@@ -409,8 +422,9 @@ def _policy_process_entry(
     seq,
     done_seq,
     stop_evt,
+    ready_evt,
 ) -> None:
-    """Child process: own interpreter/GIL — cannot stall the teleop process."""
+    """Child process: own interpreter/GIL — cannot stall the control process."""
     import os
     import time as _time
 
@@ -452,6 +466,7 @@ def _policy_process_entry(
     loader.load(checkpoint, load_optimizer=False)
     policy = loader.get_inference_policy(device=device)
     warmup_policy(policy, n=20)
+    ready_evt.set()
 
     n_obs = int(num_observations)
     n_act = int(num_actions)
@@ -479,11 +494,14 @@ def _policy_process_entry(
 
 
 class ProcessPolicyWorker:
-    """Policy in a *separate process* (own GIL) for --arm-only load simulation.
+    """Policy in a *separate process* (own GIL) for real-time deploy.
 
-    A background *thread* still shares the teleop GIL with obs/VR/hotkeys, so
-    SteamVR + torch/numpy can make ``wait≫cpu`` and also stall ``obs``/``arm``
-    on the main thread. A child process cannot hold this process's GIL.
+    Control process: build obs → submit → take_action (non-blocking) → send.
+    Apply a newly ready action immediately (no man-made action_delay buffer).
+    If take_action returns None, keep the previous command for this tick.
+
+    A background *thread* would still share the control GIL with obs/VR; a
+    child process cannot hold this process's GIL.
     """
 
     def __init__(self, checkpoint: str, device: str = "cpu", num_threads: int = 1):
@@ -503,6 +521,7 @@ class ProcessPolicyWorker:
         self._seq = self._ctx.Value("i", 0)
         self._done_seq = self._ctx.Value("i", 0)
         self._stop = self._ctx.Event()
+        self._ready = self._ctx.Event()
         self._last_taken = 0
         self._proc = self._ctx.Process(
             target=_policy_process_entry,
@@ -518,6 +537,7 @@ class ProcessPolicyWorker:
                 self._seq,
                 self._done_seq,
                 self._stop,
+                self._ready,
             ),
             name="process_policy",
             daemon=True,
@@ -538,6 +558,13 @@ class ProcessPolicyWorker:
 
     def start(self) -> None:
         self._proc.start()
+
+    def wait_ready(self, timeout: float = 120.0) -> None:
+        if not self._ready.wait(timeout):
+            raise TimeoutError(
+                f"ProcessPolicyWorker child not ready within {timeout:.0f}s "
+                "(checkpoint load / warmup)."
+            )
 
     def stop(self) -> None:
         self._stop.set()
@@ -563,6 +590,23 @@ class ProcessPolicyWorker:
         self.infer_count += 1
         with self._act.get_lock():
             return np.frombuffer(self._act.get_obj(), dtype=np.float64).copy()
+
+    def step(
+        self,
+        obs_vector: np.ndarray,
+        obs_builder,
+        action: np.ndarray,
+        *,
+        clip_actions: float,
+    ) -> np.ndarray:
+        """Submit fresh obs; apply newly ready action immediately if available."""
+        self.submit(obs_vector)
+        ready = self.take_action()
+        if ready is not None:
+            return obs_builder.update_action_history(
+                ready, clip_actions=clip_actions
+            )
+        return action
 
 
 # Back-compat alias (thread worker was GIL-coupled; prefer ProcessPolicyWorker).

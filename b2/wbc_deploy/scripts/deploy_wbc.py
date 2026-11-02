@@ -46,13 +46,10 @@ from control.incremental_ik import incremental_ik_step
 from safety.leg_shutdown import leg_joint_dict_to_array, run_leg_soft_shutdown
 from utils.math_utils import pos_quat_to_homogeneous, rotmat_to_quaternion
 from wbc_runtime import (
-    LAST_POLICY_TIMING,
     ProcessPolicyWorker,
     build_arg_parser,
     load_runtime,
     print_obs_summary,
-    run_policy,
-    warmup_policy,
 )
 
 
@@ -638,7 +635,7 @@ def run_init_deploy_sequence(
     aggregator,
     vr_goal,
     obs_builder,
-    policy,
+    async_policy: ProcessPolicyWorker,
     lowcmd_writer: B2LowCmdWriter,
     z1_writer: Optional[Z1ArmWriter],
     q_start: np.ndarray,
@@ -652,12 +649,14 @@ def run_init_deploy_sequence(
     """Ramp to init_deploy_joint, hold while printing obs, then confirm policy.
 
     Returns True if user confirms policy motor output; False to keep holding init pose.
+    Policy runs in ProcessPolicyWorker (legs stay on ramp/hold targets until confirm).
     """
     ramp_s = float(config.get("init_deploy_ramp_s", 5.0))
     hold_s = float(config.get("init_deploy_hold_s", 5.0))
     use_cmd = bool(config["commands"].get("use_cmd"))
     clip_actions = float(config.get("control", {}).get("clip_actions", 20.0))
     print_every = max(1, int(rate))
+    action = np.zeros(12, dtype=np.float64)
 
     print(
         f"\nInit deploy: ramp {ramp_s:.1f}s → hold {hold_s:.1f}s at init_deploy_joint\n"
@@ -677,9 +676,11 @@ def run_init_deploy_sequence(
         robot = aggregator.read()
         if robot.valid:
             obs_pack = obs_builder.build(robot, vr_goal)
-            action = run_policy(policy, obs_pack["obs_vector"])
-            action = obs_builder.update_action_history(
-                action, clip_actions=clip_actions
+            action = async_policy.step(
+                obs_pack["obs_vector"],
+                obs_builder,
+                action,
+                clip_actions=clip_actions,
             )
             if z1_writer is not None:
                 z1_writer.send(
@@ -715,9 +716,11 @@ def run_init_deploy_sequence(
         robot = aggregator.read()
         if robot.valid:
             obs_pack = obs_builder.build(robot, vr_goal)
-            action = run_policy(policy, obs_pack["obs_vector"])
-            action = obs_builder.update_action_history(
-                action, clip_actions=clip_actions
+            action = async_policy.step(
+                obs_pack["obs_vector"],
+                obs_builder,
+                action,
+                clip_actions=clip_actions,
             )
             if z1_writer is not None:
                 z1_writer.send(
@@ -874,16 +877,18 @@ def main() -> None:
     if args.arm_only:
         args.no_release_mode = True
 
+    # Inference always runs in ProcessPolicyWorker (child GIL). Do not load Torch
+    # into the control process.
     config, aggregator, vr_goal, obs_builder, policy, rate, dt = load_runtime(
-        args, defer_release=defer_release
+        args, defer_release=defer_release, load_policy=False
     )
-    # --arm-only intentionally leaves policy=None in-process (child loads ckpt).
-    if policy is None and not (args.arm_only and args.checkpoint):
+    if not args.checkpoint:
         print(
             "Error: checkpoint required. Set policy.checkpoint in b2z1_wbc.yaml "
             "or pass --checkpoint /path/to/model.pt"
         )
         return
+    del policy  # always None when load_policy=False
 
     default_dof = obs_builder.default_dof_pos
     action_scale = config["control"]["action_scale"]
@@ -903,9 +908,35 @@ def main() -> None:
     z1_writer = None
     hotkeys = None
     ee_goal_publisher = None
-    # Dry run and arm-only: always evaluate policy for printing (legs not applied in arm-only).
-    apply_policy = (not args.execute_actions) or args.arm_only
+    # Dry run: evaluate policy (no lowcmd). execute: gated by init confirm.
+    # arm-only: never send policy leg targets.
+    apply_policy = not args.execute_actions
     shutdown = {"stop": False}
+
+    _n_thr = int((config.get("policy") or {}).get("num_threads", 1) or 1)
+    _dev = str((config.get("policy") or {}).get("device", "cpu"))
+    async_policy = ProcessPolicyWorker(
+        checkpoint=str(args.checkpoint),
+        device=_dev,
+        num_threads=_n_thr,
+    )
+    async_policy.start()
+    print(
+        f"[policy] process worker starting (device={_dev}, threads={_n_thr})...",
+        flush=True,
+    )
+    try:
+        async_policy.wait_ready(timeout=120.0)
+    except TimeoutError as exc:
+        print(f"Error: {exc}")
+        async_policy.stop()
+        vr_goal.stop()
+        aggregator.close()
+        return
+    print(
+        "[policy] process worker ready (separate GIL; control process has no Torch).",
+        flush=True,
+    )
 
     def _request_shutdown(signum, _frame) -> None:
         shutdown["stop"] = True
@@ -961,11 +992,13 @@ def main() -> None:
                 break
             time.sleep(0.05)
         if shutdown["stop"]:
+            async_policy.stop()
             vr_goal.stop()
             aggregator.close()
             return
         if q_start is None:
             print("Error: no valid B2 state within 30 s; aborting.")
+            async_policy.stop()
             vr_goal.stop()
             aggregator.close()
             return
@@ -998,7 +1031,7 @@ def main() -> None:
             aggregator=aggregator,
             vr_goal=vr_goal,
             obs_builder=obs_builder,
-            policy=policy,
+            async_policy=async_policy,
             lowcmd_writer=lowcmd_writer,
             z1_writer=z1_writer,
             q_start=q_start,
@@ -1038,25 +1071,13 @@ def main() -> None:
     print("\nB2Z1 WBC deploy")
     print(f"  execute_actions: {args.execute_actions}")
     print(f"  arm_only       : {args.arm_only}")
-    # Policy net always runs in the control loop (loco-manip timing). apply_policy
-    # only gates whether leg targets are sent to lowcmd (never for --arm-only).
-    if args.arm_only:
-        print(
-            f"  policy_eval    : child process "
-            f"({(config.get('policy') or {}).get('device', 'cpu')})"
-        )
-    else:
-        print(f"  policy_eval    : True (every tick)")
-        try:
-            from policy.controller_loader import device as _policy_device
-            import torch as _torch
-
-            print(
-                f"  policy_device  : {_policy_device} "
-                f"(torch_num_threads={_torch.get_num_threads()})"
-            )
-        except Exception:
-            pass
+    # Policy net always runs via ProcessPolicyWorker. apply_policy only gates
+    # whether leg targets are sent to lowcmd (never for --arm-only).
+    print(
+        f"  policy_eval    : process worker every tick "
+        f"(device={(config.get('policy') or {}).get('device', 'cpu')}, "
+        f"threads={(config.get('policy') or {}).get('num_threads', 1)})"
+    )
     print(
         f"  apply_leg_cmd  : {bool(apply_policy and not args.arm_only)} "
         f"({'sport mode; actions discarded' if args.arm_only else 'lowcmd from policy' if apply_policy else 'hold init'})"
@@ -1112,32 +1133,11 @@ def main() -> None:
     _print_command_mode(config)
     print("Press Ctrl+C to stop.\n")
 
-    # --arm-only: policy in a *separate process* (own GIL). A background thread
-    # still shares this process's GIL with obs/VR — that was the remaining
-    # wait≫cpu + obs/arm stalls after ~30s. Child process cannot block teleop.
-    async_policy = None
-    if args.arm_only and args.checkpoint:
-        _n_thr = int((config.get("policy") or {}).get("num_threads", 1) or 1)
-        _dev = str((config.get("policy") or {}).get("device", "cpu"))
-        async_policy = ProcessPolicyWorker(
-            checkpoint=str(args.checkpoint),
-            device=_dev,
-            num_threads=_n_thr,
-        )
-        async_policy.start()
-        print(
-            "[policy] process worker on (arm-only): separate GIL; "
-            "teleop process does not load Torch.",
-            flush=True,
-        )
-    elif policy is not None:
-        warmup_policy(policy, n=50)
-
     step = 0
     max_work_ms = 0.0
     max_stages_ms = {}
     action = np.zeros(12, dtype=np.float64)
-    # Alloc churn is reduced; disable GC in the teleop process so rare full
+    # Alloc churn is reduced; disable GC in the control process so rare full
     # collections cannot hold the GIL for 50–150 ms mid-run. Policy child has
     # its own GC. RSS should stay flat (was ~450MB steady, not growing).
     import gc as _gc
@@ -1149,10 +1149,9 @@ def main() -> None:
     _gc.disable()
     _last_lag_note_t = 0.0
     print_hz_divider = max(1, int(rate))
-    # Arm-only: never build WBC obs on the 50 Hz teleop hot path. Logs showed
-    # policy wait=0 while obs=30–67ms still stretched the *next* arm tick
-    # (send-then-obs still overruns dt). Rebuild at 1 Hz for prints; feed the
-    # policy child a cached vector at 25 Hz for loco-manip CPU load only.
+    # Arm-only test: skip WBC obs on the 50 Hz teleop hot path; rebuild at 1 Hz
+    # for prints and feed the child a cached vector at 25 Hz for load only.
+    # Full control: fresh obs every tick (no cache).
     _load_sim_obs = np.zeros(_num_observations, dtype=np.float64)
     _last_obs_pack = {
         "phase_variable": 0.0,
@@ -1202,14 +1201,13 @@ def main() -> None:
                 else:
                     obs_pack = _last_obs_pack
 
-                # Cheap shared-memory copy only — no obs_builder on this path.
-                if async_policy is not None and (do_print or step % 2 == 0):
-                    async_policy.submit(_load_sim_obs)
-                    ready = async_policy.take_action()
-                    if ready is not None:
-                        action = obs_builder.update_action_history(
-                            ready, clip_actions=clip_actions
-                        )
+                if do_print or step % 2 == 0:
+                    action = async_policy.step(
+                        _load_sim_obs,
+                        obs_builder,
+                        action,
+                        clip_actions=clip_actions,
+                    )
                     policy_stage_ms = float(async_policy.last_infer_ms)
 
                 if do_print:
@@ -1227,17 +1225,22 @@ def main() -> None:
                     "obs": obs_ms,
                     "policy": policy_stage_ms,
                 }
-                # Arm feel = read+arm only (obs only on 1 Hz print ticks).
                 teleop_ms = stages_ms["read"] + stages_ms["arm"]
             else:
+                # Full control: fresh obs every tick → async policy → send.
+                # Apply newly ready action immediately (no man-made delay);
+                # if child not done yet, keep previous action for this tick.
                 obs_pack = obs_builder.build(robot, vr_goal, debug=do_print)
                 t_obs = time.perf_counter()
 
+                action = async_policy.step(
+                    obs_pack["obs_vector"],
+                    obs_builder,
+                    action,
+                    clip_actions=clip_actions,
+                )
+                policy_stage_ms = float(async_policy.last_infer_ms)
                 if apply_policy:
-                    action = run_policy(policy, obs_pack["obs_vector"])
-                    action = obs_builder.update_action_history(
-                        action, clip_actions=clip_actions
-                    )
                     leg_q_target = leg_targets_from_action(
                         action, default_dof, action_scale, clip_actions=clip_actions
                     )
@@ -1266,8 +1269,10 @@ def main() -> None:
                 stages_ms = {
                     "read": (t_read - t0) * 1000.0,
                     "obs": (t_obs - t_read) * 1000.0,
+                    # Parent-side IPC only (child infer is overlapped).
                     "policy": (t_policy_pre - t_obs) * 1000.0,
                     "arm": (t_arm - t_policy_pre) * 1000.0,
+                    "infer": policy_stage_ms,
                 }
                 teleop_ms = work_ms
 
@@ -1297,41 +1302,60 @@ def main() -> None:
                             "  policy         : process-worker "
                             f"(last_infer={policy_stage_ms:.2f}ms, legs not applied)"
                         )
-                    elif args.execute_actions and not apply_policy:
+                    else:
                         print(
-                            "  leg_cmd        : holding init_deploy_joint "
-                            "(policy not applied)"
+                            "  policy         : process-worker "
+                            f"(last_infer={async_policy.last_infer_ms:.2f}ms "
+                            f"wait={async_policy.last_wait_ms:.2f}ms)"
                         )
+                        if args.execute_actions and not apply_policy:
+                            print(
+                                "  leg_cmd        : holding init_deploy_joint "
+                                "(policy not applied)"
+                            )
                 if z1_writer is not None:
                     print(f"  arm_teleop     : {z1_writer.status_line()}")
-                    # Arm-only: overrun = read+arm only (obs runs after arm now).
-                    overrun = step > 0 and max_work_ms > dt * 1000.0 * 1.5
-                    if overrun:
-                        rss_mb = _resource.getrusage(
-                            _resource.RUSAGE_SELF
-                        ).ru_maxrss / 1024.0
+                overrun = step > 0 and max_work_ms > dt * 1000.0 * 1.5
+                if overrun:
+                    rss_mb = _resource.getrusage(
+                        _resource.RUSAGE_SELF
+                    ).ru_maxrss / 1024.0
+                    if z1_writer is not None:
                         ik_ms = float(z1_writer._last_status.get("arm_ik_ms") or 0.0)
                         cmd_ms = float(z1_writer._last_status.get("arm_cmd_ms") or 0.0)
                         print(
-                            f"  arm_lag_hint   : arm_crit now={teleop_ms:.0f}ms "
+                            f"  arm_lag_hint   : now={teleop_ms:.0f}ms "
                             f"max={max_work_ms:.0f}ms > dt={dt*1000.0:.0f}ms "
                             f"(read={max_stages_ms.get('read', 0):.1f} "
                             f"arm={max_stages_ms.get('arm', 0):.1f} "
                             f"ik={ik_ms:.1f} cmd={cmd_ms:.1f} | "
-                            f"obs_after={max_stages_ms.get('obs', 0):.1f} ms) "
+                            f"obs={max_stages_ms.get('obs', 0):.1f} "
+                            f"ipc={max_stages_ms.get('policy', 0):.1f} "
+                            f"infer={max_stages_ms.get('infer', policy_stage_ms):.1f} ms) "
                             f"rss={rss_mb:.0f}MB."
                         )
-                        now_t = time.perf_counter()
-                        if async_policy is not None and now_t - _last_lag_note_t >= 5.0:
-                            _last_lag_note_t = now_t
-                            print(
-                                f"  policy_timing  : wall={async_policy.last_infer_ms:.2f}ms "
-                                f"cpu={async_policy.last_cpu_ms:.2f}ms "
-                                f"wait={async_policy.last_wait_ms:.2f}ms "
-                                f"(child process; should not block arm)."
-                            )
-                    max_work_ms = 0.0
-                    max_stages_ms = {}
+                    else:
+                        print(
+                            f"  loop_lag_hint  : now={teleop_ms:.0f}ms "
+                            f"max={max_work_ms:.0f}ms > dt={dt*1000.0:.0f}ms "
+                            f"(read={max_stages_ms.get('read', 0):.1f} "
+                            f"obs={max_stages_ms.get('obs', 0):.1f} "
+                            f"ipc={max_stages_ms.get('policy', 0):.1f} "
+                            f"infer={max_stages_ms.get('infer', policy_stage_ms):.1f} ms) "
+                            f"rss={rss_mb:.0f}MB."
+                        )
+                    now_t = time.perf_counter()
+                    if now_t - _last_lag_note_t >= 5.0:
+                        _last_lag_note_t = now_t
+                        print(
+                            f"  policy_timing  : wall={async_policy.last_infer_ms:.2f}ms "
+                            f"cpu={async_policy.last_cpu_ms:.2f}ms "
+                            f"wait={async_policy.last_wait_ms:.2f}ms "
+                            f"(child process; overlapped with control)."
+                        )
+                max_work_ms = 0.0
+                max_stages_ms = {}
+                if z1_writer is not None:
                     mode = z1_writer._last_status.get("mode")
                     if mode == "hold_no_vr":
                         print(

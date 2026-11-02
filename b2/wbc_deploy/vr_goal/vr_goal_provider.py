@@ -12,7 +12,6 @@ from typing import Optional
 import numpy as np
 
 from teleop.vr_pose_mapper import VrPoseMapper
-from teleop.vr_websocket_client import VrWebSocketClient
 
 from utils.math_utils import (
     pos_quat_to_homogeneous,
@@ -92,8 +91,27 @@ class VrGoalProvider:
         port: int = 8765,
         config_path: Optional[str] = None,
         arm_mount_in_base: Optional[np.ndarray] = None,
+        *,
+        use_process_client: bool = True,
+        client=None,
     ):
-        self.client = VrWebSocketClient(host=host, port=port, config_path=config_path)
+        # Default: VR websocket + JSON parse in a child process (own GIL), same
+        # isolation idea as ProcessPolicyWorker. Pass client=... to inject a
+        # mock / in-thread VrWebSocketClient for tests.
+        if client is not None:
+            self.client = client
+        elif use_process_client:
+            from vr_goal.process_vr_client import ProcessVrWorker
+
+            self.client = ProcessVrWorker(
+                host=host, port=port, config_path=config_path
+            )
+        else:
+            from teleop.vr_websocket_client import VrWebSocketClient
+
+            self.client = VrWebSocketClient(
+                host=host, port=port, config_path=config_path
+            )
         self.mapper = VrPoseMapper(config_path=config_path)
         self.arm_mount_in_base = np.asarray(
             [0.03, 0.0, 0.09] if arm_mount_in_base is None else arm_mount_in_base,
@@ -111,6 +129,9 @@ class VrGoalProvider:
     def start(self) -> None:
         if not self._started:
             self.client.start()
+            wait_ready = getattr(self.client, "wait_ready", None)
+            if callable(wait_ready):
+                wait_ready(timeout=30.0)
             self._started = True
 
     def stop(self) -> None:
