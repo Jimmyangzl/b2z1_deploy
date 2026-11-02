@@ -98,6 +98,7 @@ class B2StateReader:
         # quat_rotate_inverse(base_quat, root_ω_world), which is also body-frame.
         # Do NOT rotate the IMU gyro again (that would double-apply R^{-1}).
         gyro_body = np.array(imu.gyroscope, dtype=np.float64)
+        accel_body = np.array(imu.accelerometer, dtype=np.float64)
         leg_q_motor = np.array([low.motor_state[i].q for i in range(12)], dtype=np.float64)
         leg_dq_motor = np.array([low.motor_state[i].dq for i in range(12)], dtype=np.float64)
         leg_q = motor_legs_to_sim(leg_q_motor)
@@ -109,7 +110,8 @@ class B2StateReader:
         base_pos = np.zeros(3, dtype=np.float64)
         base_lin_vel_world = np.zeros(3, dtype=np.float64)
         # Intentionally ignore sport.position: deploy kinematics use the robot
-        # base frame (origin at base). Sport velocity is still used for twist.
+        # base frame (origin at base). Sport velocity is still used for twist
+        # unless the IMU base-vel estimator replaces it in the aggregator.
         if sport is not None:
             base_lin_vel_world = np.array(sport.velocity, dtype=np.float64)
 
@@ -125,6 +127,7 @@ class B2StateReader:
             "base_ang_vel_world": gyro_body,  # name kept; value is body-frame IMU ω
             "base_lin_vel_local": base_lin_vel_local,
             "base_ang_vel_local": base_ang_vel_local,
+            "accel_body": accel_body,
             "leg_q": leg_q,
             "leg_dq": leg_dq,
             "leg_q_motor": leg_q_motor_raw,

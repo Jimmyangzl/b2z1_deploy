@@ -8,6 +8,7 @@ import numpy as np
 import yaml
 
 from state.b2_reader import B2StateReader
+from state.imu_base_vel_estimator import ImuBaseVelEstimator
 from state.robot_state import RobotState
 from state.z1_reader import Z1StateReader
 from utils.urdf_arm_base import load_arm_base_offset_from_urdf
@@ -79,6 +80,16 @@ class RobotStateAggregator:
             default_arm_q=np.array(config["arm_init_joint"], dtype=np.float64),
         )
 
+        vel_cfg = config.get("base_vel_estimator") or {}
+        self._imu_vel_enabled = bool(vel_cfg.get("enabled", True))
+        self._imu_vel = ImuBaseVelEstimator(vel_cfg) if self._imu_vel_enabled else None
+        if self._imu_vel_enabled:
+            print(
+                "[base_vel] IMU estimator on "
+                f"(accel_residual<{float(vel_cfg.get('accel_residual_thresh', 0.8)):.2f} "
+                f"or ||leg_dq||<{float(vel_cfg.get('joint_dq_thresh', 0.25)):.2f} → ZUPT)"
+            )
+
     def release_motion_mode(self) -> None:
         self.b2.release_motion_mode()
 
@@ -105,13 +116,27 @@ class RobotStateAggregator:
 
         foot_contacts = b2["foot_force"] > self.foot_contact_threshold
 
+        base_lin_vel_local = b2["base_lin_vel_local"]
+        base_lin_vel_world = b2["base_lin_vel_world"]
+        if self._imu_vel is not None:
+            accel = b2.get("accel_body")
+            if accel is not None:
+                v_local, v_world, _zupt = self._imu_vel.update(
+                    b2["base_quat"],
+                    accel,
+                    b2["leg_dq"],
+                    b2["timestamp"],
+                )
+                base_lin_vel_local = v_local
+                base_lin_vel_world = v_world
+
         return RobotState(
             base_quat=b2["base_quat"],
             # Always zero: EE / goals are in robot base frame (no sport odom).
             base_pos=np.zeros(3, dtype=np.float64),
-            base_lin_vel_world=b2["base_lin_vel_world"],
+            base_lin_vel_world=base_lin_vel_world,
             base_ang_vel_world=b2["base_ang_vel_world"],
-            base_lin_vel_local=b2["base_lin_vel_local"],
+            base_lin_vel_local=base_lin_vel_local,
             base_ang_vel_local=b2["base_ang_vel_local"],
             leg_q=b2["leg_q"],
             leg_dq=b2["leg_dq"],

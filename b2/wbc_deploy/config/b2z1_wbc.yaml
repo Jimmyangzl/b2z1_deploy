@@ -69,6 +69,16 @@ observation:
   # Match training normalization.clip_observations (applied to policy obs_vector).
   clip_observations: 100.0
 
+# Replace stale sport.velocity after ReleaseMode with IMU strapdown + ZUPT.
+# ZUPT when ||a_lin|| < accel_residual_thresh OR ||leg_dq|| < joint_dq_thresh.
+base_vel_estimator:
+  enabled: true
+  gravity: 9.81
+  accel_residual_thresh: 0.8   # m/s^2
+  joint_dq_thresh: 0.25        # ||leg_dq|| rad/s
+  max_dt: 0.05
+  max_speed: 2.5
+
 robot:
   # Arm mount from URDF fixed joint base_static_joint (overrides any hardcoded offset).
   urdf: urdf/b2z1.urdf
