@@ -152,7 +152,7 @@ class ObservationBuilder:
           xy = (dvel_x_amp, dvel_y_amp) * unit(goal in base_yaw xy)
           yaw = dvel_yaw_amp * sign(goal_yaw - base_yaw)
         masks (same as arm_control.update_rfm_state):
-          mask_xy:   (manip_pred > 1e-3 or dist(ee, mount)_xy < 0.65) and phase < 0.5
+          mask_xy:   (manip_pred > 1e-3 or dist(ee, mount)_xy < 0.6) and phase < 0.5
                      → zero xy
           mask_back: manip_pred < 5e-4 and dist(ee, mount)_xy < 0.1 and phase < 0.5
                      → flip xy
@@ -200,7 +200,7 @@ class ObservationBuilder:
         arm_mount_yaw = np.asarray(self.policy_arm_base_offset, dtype=np.float64)
         self.dist_base_ee = float(np.linalg.norm((ee_yaw - arm_mount_yaw)[:2]))
         mask_xy = (
-            (manip_pred_last > 0.001) or (self.dist_base_ee < 0.65)
+            (manip_pred_last > 0.001) or (self.dist_base_ee < 0.6)
         ) and (self.phase_variable < 0.5)
         mask_yaw = ee_euler_error > 0.785
         mask_back = (
