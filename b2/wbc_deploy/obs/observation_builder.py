@@ -152,7 +152,7 @@ class ObservationBuilder:
           xy = (dvel_x_amp, dvel_y_amp) * unit(goal in base_yaw xy)
           yaw = dvel_yaw_amp * sign(goal_yaw - base_yaw)
         masks (same as arm_control.update_rfm_state):
-          mask_xy:   (manip_pred > 1e-3 or dist(ee, mount)_xy < 0.6) and phase < 0.5
+          mask_xy:   (manip_pred > 1e-3 or dist(ee, mount)_xy < 0.65) and phase < 0.5
                      → zero xy
           mask_back: manip_pred < 5e-4 and dist(ee, mount)_xy < 0.1 and phase < 0.5
                      → flip xy
@@ -200,7 +200,7 @@ class ObservationBuilder:
         arm_mount_yaw = np.asarray(self.policy_arm_base_offset, dtype=np.float64)
         self.dist_base_ee = float(np.linalg.norm((ee_yaw - arm_mount_yaw)[:2]))
         mask_xy = (
-            (manip_pred_last > 0.001) or (self.dist_base_ee < 0.6)
+            (manip_pred_last > 0.001) or (self.dist_base_ee < 0.65)
         ) and (self.phase_variable < 0.5)
         mask_yaw = ee_euler_error > 0.785
         mask_back = (
@@ -224,8 +224,8 @@ class ObservationBuilder:
         if abs(self.dvel_b_local[2]) < self.ang_vel_yaw_clip:
             self.dvel_b_local[2] = 0.0
 
-        if not vr_goal.is_active:
-            self.dvel_b_local[:] = 0.0
+        # if not vr_goal.is_active:
+        #     self.dvel_b_local[:] = 0.0
 
     def _locomotion_obs(self) -> np.ndarray:
         if self.use_cmd:
@@ -349,9 +349,15 @@ class ObservationBuilder:
             "use_cmd": self.use_cmd,
             "commands": self.commands,
             "dvel_b_local": self.dvel_b_local,
+            # Always publish: ProcessObs IPC + deploy prints (was debug-only →
+            # showed dist_base_ee=0 every tick and looked like RFM was broken).
+            "dist_base_ee": float(self.dist_base_ee),
+            "manip_det": float(manip_det),
             "base_lin_vel": np.asarray(base_lin_vel, dtype=np.float64).copy(),
             "ee_pos": np.asarray(ee_pos, dtype=np.float64).reshape(3).copy(),
             "ee_quat": np.asarray(ee_quat, dtype=np.float64).reshape(4).copy(),
+            "ee_goal_base": np.asarray(goal_base, dtype=np.float64).reshape(3).copy(),
+            "ee_goal_world": np.asarray(goal_base, dtype=np.float64).reshape(3).copy(),
         }
         if not debug:
             return out
@@ -362,11 +368,7 @@ class ObservationBuilder:
                 "privileged": self.privileged_obs.copy(),
                 "history": history_flat,
                 "slices": self._named_slices(proprio),
-                "ee_goal_base": goal_base,
-                "ee_goal_world": goal_base,
                 "locomotion_obs": locomotion_obs.copy(),
-                "dist_base_ee": self.dist_base_ee,
-                "manip_det": manip_det,
                 "manip_det_pred": self.manip.manip_det_pred.copy(),
                 "gait_indices": gait_indices,
                 "clock_inputs": clock_inputs,

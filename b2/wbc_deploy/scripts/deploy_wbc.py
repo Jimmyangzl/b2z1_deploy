@@ -45,6 +45,7 @@ from control.gains import GainLike, as_gain_vector
 from control.incremental_ik import incremental_ik_step
 from safety.leg_shutdown import leg_joint_dict_to_array, run_leg_soft_shutdown
 from utils.math_utils import pos_quat_to_homogeneous, rotmat_to_quaternion
+from obs.process_obs_worker import ProcessObsWorker
 from wbc_runtime import (
     ProcessPolicyWorker,
     build_arg_parser,
@@ -206,8 +207,10 @@ class Z1ArmWriter:
         gripper_kp: float = 20.0,
         gripper_kd: float = 2000.0,
     ):
-        if control_mode not in ("wbc", "tdes"):
-            raise ValueError(f"control_mode must be 'wbc' or 'tdes', got {control_mode!r}")
+        if control_mode not in ("wbc", "tdes", "act"):
+            raise ValueError(
+                f"control_mode must be 'wbc', 'tdes', or 'act', got {control_mode!r}"
+            )
         fsm_mode = str(fsm_mode).lower().strip()
         if fsm_mode not in ("jointctrl", "lowcmd"):
             raise ValueError(f"fsm_mode must be 'jointctrl' or 'lowcmd', got {fsm_mode!r}")
@@ -561,6 +564,69 @@ class Z1ArmWriter:
             return self._q_hold if self._q_hold is not None else q_meas.copy()
         return q_ik
 
+    def _cmd_from_act(self, act_goal, q_meas: np.ndarray) -> np.ndarray:
+        """Arm-base IK on ACT ``ee_goal_local_cart`` / ``ee_goal_quat_base``.
+
+        Holds last joint command until the first valid ACT goal arrives; then
+        holds last goal between ACT updates (provider already hold-last).
+        """
+        latest = None
+        if act_goal is not None and hasattr(act_goal, "latest_arm_goal"):
+            latest = act_goal.latest_arm_goal()
+        self._last_status.update(
+            {
+                "vr_connected": False,
+                "holding": latest is None,
+                "mode": "hold_no_act" if latest is None else "act",
+                "has_ik": None,
+            }
+        )
+        if latest is None:
+            return self._q_hold if self._q_hold is not None else q_meas.copy()
+
+        cart = np.asarray(latest["ee_goal_local_cart"], dtype=np.float64).reshape(3)
+        quat = np.asarray(latest["ee_goal_quat_base"], dtype=np.float64).reshape(4)
+        qn = float(np.linalg.norm(quat))
+        quat = (
+            quat / qn
+            if qn > 1e-12
+            else np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        )
+        T_goal = pos_quat_to_homogeneous(cart, quat)
+        self._store_T_goal(T_goal)
+        if (self._status_tick % 50) == 0:
+            pos_err, rot_err = self._pose_error_norms(T_goal, q_meas)
+            self._last_status["pos_err"] = pos_err
+            self._last_status["rot_err"] = rot_err
+        self._status_tick += 1
+
+        dq_max = 0.25
+        q_ana = self._solve_ik(T_goal, q_meas)
+        if q_ana is not None:
+            q_cmd = q_meas + np.clip(q_ana - q_meas, -dq_max, dq_max)
+            self._last_status["mode"] = "act_ana"
+        else:
+            T_ee = np.asarray(
+                self._arm_model.forwardKinematics(q_meas, 6),
+                dtype=np.float64,
+            ).reshape(4, 4)
+            T_pos_only = T_ee.copy()
+            T_pos_only[:3, 3] = T_goal[:3, 3]
+            q_pos = self._solve_ik(T_pos_only, q_meas)
+            if q_pos is not None:
+                self._last_status["has_ik"] = False
+                q_cmd = q_meas + np.clip(q_pos - q_meas, -dq_max, dq_max)
+                self._last_status["mode"] = "act_pos_only"
+            else:
+                q_ik = self._solve_ik_incremental(T_pos_only, q_meas)
+                if q_ik is None:
+                    self._last_status["mode"] = "hold_ik_fail"
+                    return q_meas.copy()
+                q_cmd = q_meas + np.clip(q_ik - q_meas, -dq_max, dq_max)
+                self._last_status["mode"] = "act_inc_pos"
+        self._last_status["q_err"] = float(np.linalg.norm(q_cmd - q_meas))
+        return q_cmd
+
     def send(
         self,
         gripper_q: float,
@@ -569,7 +635,7 @@ class Z1ArmWriter:
         obs_builder,
         phase_variable: float = 0.0,
     ) -> None:
-        del obs_builder, gripper_q  # command comes from space-toggle latch
+        del obs_builder  # unused on hot path
         if not self._ensure_ready():
             return
 
@@ -582,9 +648,26 @@ class Z1ArmWriter:
         if self.control_mode == "tdes":
             q_cmd = self._cmd_from_tdes(vr_goal, q_meas)
             # teleop_z1 does not apply training hard_dof clips on arm cmd.
+            grip_cmd = self.gripper_command()
+        elif self.control_mode == "act":
+            q_cmd = self._cmd_from_act(vr_goal, q_meas)
+            q_cmd = self._apply_joint_limits(q_cmd)
+            # Prefer ACT gripper; fall back to space-latch / explicit arg.
+            grip_cmd = getattr(vr_goal, "gripper_cmd", None)
+            if grip_cmd is None or not np.isfinite(float(grip_cmd)):
+                grip_cmd = (
+                    float(gripper_q)
+                    if gripper_q is not None and np.isfinite(float(gripper_q))
+                    else self.gripper_command()
+                )
+            else:
+                grip_cmd = float(grip_cmd)
+                with self._gripper_lock:
+                    self._gripper_pos = grip_cmd
         else:
             q_cmd = self._cmd_from_wbc(robot, vr_goal, phase_variable, q_meas)
             q_cmd = self._apply_joint_limits(q_cmd)
+            grip_cmd = self.gripper_command()
         t_ik = time.perf_counter()
 
         self._q_hold = q_cmd.copy()
@@ -603,7 +686,7 @@ class Z1ArmWriter:
         self._arm.qd = qd_cmd
         self._arm.tau = tau_f
         self._arm.setArmCmd(_vec6(q_cmd), _vec6(qd_cmd), _vec6(tau_f))
-        self._arm.setGripperCmd(self.gripper_command(), 0.0, 0.0)
+        self._arm.setGripperCmd(float(grip_cmd), 0.0, 0.0)
         t_cmd = time.perf_counter()
         self._last_status["arm_ik_ms"] = (t_ik - t_send0) * 1000.0
         self._last_status["arm_cmd_ms"] = (t_cmd - t_ik) * 1000.0
@@ -629,12 +712,64 @@ def _sleep_dt(dt: float, shutdown: dict) -> None:
         time.sleep(min(0.05, end - time.perf_counter()))
 
 
+def _vr_pose_for_obs(vr_goal) -> Optional[dict]:
+    client = getattr(vr_goal, "client", None)
+    if client is None:
+        return None
+    return client.get_latest_pose()
+
+
+def run_z1_act_arm_prep(config: dict) -> None:
+    """Move Z1 to arm_init_joint and release (same role as vr_websocket_server prep).
+
+    Uses a temporary ArmInterface; must run before aggregator.start_z1_loop().
+    """
+    import sys as _sys
+
+    teleop_dir = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__), "..", "..", "..", "z1", "teleop"
+        )
+    )
+    act_dir = os.path.dirname(teleop_dir)
+    if act_dir not in _sys.path:
+        _sys.path.insert(0, act_dir)
+    from teleop.z1_robot_prep import Z1RobotPrep, load_arm_init_joint
+
+    move_duration = float(config.get("teleop_prep_move_duration", 3.0))
+    connect_timeout = float(config.get("teleop_prep_connect_timeout", 10.0))
+    # Prefer WBC yaml arm_init_joint; fall back to teleop loader.
+    init_joints = np.asarray(
+        config.get("arm_init_joint")
+        if config.get("arm_init_joint") is not None
+        else load_arm_init_joint(config),
+        dtype=np.float64,
+    ).reshape(6)
+    print(
+        "[act-ee] Z1 prep → arm_init_joint "
+        f"{np.array2string(init_joints, precision=4)} "
+        f"(duration={move_duration:.1f}s)",
+        flush=True,
+    )
+    prep = Z1RobotPrep(
+        init_joints=init_joints,
+        move_duration=move_duration,
+        connect_timeout=connect_timeout,
+    )
+    prep.prepare_and_hold()
+    # Brief settle at init, then release so deploy ArmInterface can loopOn.
+    time.sleep(0.3)
+    prep.release_hold()
+    print("[act-ee] Z1 prep released; deploy will take JOINTCTRL.", flush=True)
+
+
 def run_init_deploy_sequence(
     *,
     config: dict,
     aggregator,
     vr_goal,
     obs_builder,
+    async_obs: ProcessObsWorker,
     async_policy: ProcessPolicyWorker,
     lowcmd_writer: B2LowCmdWriter,
     z1_writer: Optional[Z1ArmWriter],
@@ -649,8 +784,9 @@ def run_init_deploy_sequence(
     """Ramp to init_deploy_joint, hold while printing obs, then confirm policy.
 
     Returns True if user confirms policy motor output; False to keep holding init pose.
-    Policy runs in ProcessPolicyWorker (legs stay on ramp/hold targets until confirm).
+    Obs + policy run in child processes (legs stay on ramp/hold until confirm).
     """
+    del obs_builder  # history / build live in async_obs child
     ramp_s = float(config.get("init_deploy_ramp_s", 5.0))
     hold_s = float(config.get("init_deploy_hold_s", 5.0))
     use_cmd = bool(config["commands"].get("use_cmd"))
@@ -662,6 +798,22 @@ def run_init_deploy_sequence(
         f"\nInit deploy: ramp {ramp_s:.1f}s → hold {hold_s:.1f}s at init_deploy_joint\n"
         f"  target (sim FL/FR/RL/RR): {np.array2string(q_init, precision=3)}"
     )
+
+    def _tick_obs_policy(robot, *, debug: bool):
+        nonlocal action
+        if hasattr(vr_goal, "latest_arm_goal"):
+            vr_goal.update(robot.ee_pos, robot.ee_quat, robot.base_quat)
+            async_obs.set_act_goal(vr_goal.latest_arm_goal())
+        obs_pack = async_obs.step(
+            robot, _vr_pose_for_obs(vr_goal), debug=debug
+        )
+        action = async_policy.step(
+            obs_pack["obs_vector"],
+            action,
+            clip_actions=clip_actions,
+            on_action=async_obs.push_action,
+        )
+        return obs_pack, action
 
     # --- ramp ---
     ramp_steps = max(1, int(ramp_s * rate))
@@ -675,19 +827,14 @@ def run_init_deploy_sequence(
 
         robot = aggregator.read()
         if robot.valid:
-            obs_pack = obs_builder.build(robot, vr_goal)
-            action = async_policy.step(
-                obs_pack["obs_vector"],
-                obs_builder,
-                action,
-                clip_actions=clip_actions,
-            )
+            do_print = i % print_every == 0 or i == ramp_steps - 1
+            obs_pack, action = _tick_obs_policy(robot, debug=do_print)
             if z1_writer is not None:
                 z1_writer.send(
                     gripper_q=robot.gripper_q,
                     robot=robot,
                     vr_goal=vr_goal,
-                    obs_builder=obs_builder,
+                    obs_builder=None,
                     phase_variable=obs_pack["phase_variable"],
                 )
             _maybe_publish_ee(
@@ -696,7 +843,7 @@ def run_init_deploy_sequence(
                 None if z1_writer is None else z1_writer.gripper_command(),
                 z1_writer=z1_writer,
             )
-            if i % print_every == 0 or i == ramp_steps - 1:
+            if do_print:
                 print(f"\n=== init ramp {i + 1}/{ramp_steps} (alpha={alpha:.2f}) ===")
                 print_obs_summary(i, obs_pack, action, use_cmd=use_cmd)
 
@@ -715,19 +862,14 @@ def run_init_deploy_sequence(
 
         robot = aggregator.read()
         if robot.valid:
-            obs_pack = obs_builder.build(robot, vr_goal)
-            action = async_policy.step(
-                obs_pack["obs_vector"],
-                obs_builder,
-                action,
-                clip_actions=clip_actions,
-            )
+            do_print = i % print_every == 0 or i == hold_steps - 1
+            obs_pack, action = _tick_obs_policy(robot, debug=do_print)
             if z1_writer is not None:
                 z1_writer.send(
                     gripper_q=robot.gripper_q,
                     robot=robot,
                     vr_goal=vr_goal,
-                    obs_builder=obs_builder,
+                    obs_builder=None,
                     phase_variable=obs_pack["phase_variable"],
                 )
             _maybe_publish_ee(
@@ -736,7 +878,7 @@ def run_init_deploy_sequence(
                 None if z1_writer is None else z1_writer.gripper_command(),
                 z1_writer=z1_writer,
             )
-            if i % print_every == 0 or i == hold_steps - 1:
+            if do_print:
                 print(f"\n=== init hold {i + 1}/{hold_steps} ===")
                 print_obs_summary(i, obs_pack, action, use_cmd=use_cmd)
 
@@ -776,7 +918,7 @@ def run_init_deploy_sequence(
 
     print("Confirmed. Switching to policy gains and applying policy actions.")
     # Drop init ramp/hold policy leftovers so step-0 obs matches a clean episode start.
-    obs_builder.reset()
+    async_obs.reset()
     print("  obs/action history reset after confirm (clean last_leg_actions).")
     lowcmd_writer.set_gains(config["control"]["kp"], config["control"]["kd"])
     return True
@@ -847,6 +989,27 @@ def main() -> None:
         action="store_true",
         help="After policy starts, update cmd_vx/vy/yaw via keyboard (w/s/a/d/q/e; 0=stop)",
     )
+    parser.add_argument(
+        "--act-ee",
+        action="store_true",
+        help=(
+            "EE goals from ACT over WebSocket (not VR). Starts ActGoalWsServer; "
+            "Z1 uses arm-base IK on ee_goal_local_cart/quat; runs Z1 arm_init prep "
+            "(no vr_websocket_server)."
+        ),
+    )
+    parser.add_argument(
+        "--act-goal-ws-host",
+        type=str,
+        default="0.0.0.0",
+        help="Bind host for ACT→deploy goal WebSocket (default 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--act-goal-ws-port",
+        type=int,
+        default=8771,
+        help="Port for ACT→deploy goal WebSocket (default 8771)",
+    )
     args = parser.parse_args()
 
     if args.arm_only and args.legs_only:
@@ -855,6 +1018,29 @@ def main() -> None:
     if args.arm_only and args.no_vr:
         print("Error: --arm-only requires VR (Tdes path). Do not pass --no-vr.")
         return
+    if args.act_ee and args.arm_only:
+        print("Error: --act-ee cannot be combined with --arm-only (VR Tdes).")
+        return
+    if args.act_ee and args.legs_only:
+        print("Error: --act-ee requires Z1 arm control (do not pass --legs-only).")
+        return
+    # online_infer needs measured EE on :8770; always enable with --act-ee.
+    if args.act_ee and not getattr(args, "ee_goal_ws", False):
+        args.ee_goal_ws = True
+        print("[act-ee] auto-enabling --ee-goal-ws (measured EE stream for ACT).")
+
+    if args.act_ee:
+        args.no_vr = True
+        print("WARNING: --act-ee will command Z1 from ACT WebSocket goals.")
+        print("  Arm: arm-base IK on ee_goal_local_cart / ee_goal_quat_base + gripper.")
+        print("  Prep: move to arm_init_joint (like vr_websocket_server), no VR server.")
+        print(
+            f"  ACT goal WS: ws://{args.act_goal_ws_host}:{args.act_goal_ws_port}"
+        )
+        confirm = input("Type YES to start ACT-EE deploy: ")
+        if confirm.strip() != "YES":
+            print("Aborted.")
+            return
 
     if args.arm_only:
         print("WARNING: --arm-only will command the Z1 arm.")
@@ -872,8 +1058,8 @@ def main() -> None:
             print("Aborted.")
             return
 
-    # Arm-only: never release sport. Full execute: defer release until lowcmd ready.
-    defer_release = bool(args.execute_actions or args.arm_only)
+    # Arm-only: never release sport. Full execute / ACT-EE: defer until writers ready.
+    defer_release = bool(args.execute_actions or args.arm_only or args.act_ee)
     if args.arm_only:
         args.no_release_mode = True
 
@@ -889,6 +1075,99 @@ def main() -> None:
         )
         return
     del policy  # always None when load_policy=False
+
+    act_goal_server = None
+    ee_goal_publisher = None
+    ee_pump_stop = threading.Event()
+    ee_pump_thread = None
+
+    def _start_ee_goal_ws() -> None:
+        nonlocal ee_goal_publisher
+        if ee_goal_publisher is not None or not getattr(args, "ee_goal_ws", False):
+            return
+        from streaming.ee_goal_ws_server import EeGoalWsServer
+
+        stream_cfg = config.get("streaming") or {}
+        ee_host = args.ee_goal_ws_host or stream_cfg.get("host", "0.0.0.0")
+        ee_port = int(
+            args.ee_goal_ws_port
+            if args.ee_goal_ws_port is not None
+            else stream_cfg.get("port", 8770)
+        )
+        ee_rate = float(
+            args.ee_goal_ws_rate
+            if args.ee_goal_ws_rate is not None
+            else stream_cfg.get("rate_hz", 50.0)
+        )
+        ee_goal_publisher = EeGoalWsServer(host=ee_host, port=ee_port, rate_hz=ee_rate)
+        ee_goal_publisher.start()
+
+    def _publish_measured_ee(robot) -> None:
+        """Push measured arm-base EE (+ base vel) for ACT / data_record clients."""
+        if robot is None or not robot.valid:
+            return
+        ee_pos = np.asarray(robot.ee_pos, dtype=np.float64).reshape(3)
+        ee_quat = np.asarray(robot.ee_quat, dtype=np.float64).reshape(4)
+        if not (np.all(np.isfinite(ee_pos)) and np.all(np.isfinite(ee_quat))):
+            return
+        base_lin = np.asarray(
+            robot.base_lin_vel_local, dtype=np.float64
+        ).reshape(3)
+        grip = float(robot.gripper_q)
+        # Primary ACT path: measured EE on the same WS as goals (:8771).
+        if act_goal_server is not None:
+            act_goal_server.publish_ee_state(
+                ee_pos,
+                ee_quat,
+                base_lin_vel=base_lin,
+                gripper_cmd=grip,
+            )
+        if ee_goal_publisher is not None:
+            ee_goal_publisher.update(
+                ee_pos,
+                gripper_cmd=grip,
+                base_lin_vel=base_lin,
+                ee_goal_quat_base=ee_quat,
+                ee_pos=ee_pos,
+                ee_quat=ee_quat,
+            )
+
+    def _ee_pump_loop() -> None:
+        """Keep EE WS valid while policy/obs workers load (ACT can connect early)."""
+        while not ee_pump_stop.is_set():
+            try:
+                _publish_measured_ee(aggregator.read())
+            except Exception:
+                pass
+            time.sleep(0.02)
+
+    if args.act_ee:
+        from streaming.act_goal_ws_server import ActGoalWsServer
+        from vr_goal.act_goal_provider import ActGoalProvider
+
+        run_z1_act_arm_prep(config)
+        aggregator.start_z1_loop()
+        act_goal_server = ActGoalWsServer(
+            host=str(args.act_goal_ws_host),
+            port=int(args.act_goal_ws_port),
+        )
+        act_goal_server.start()
+        # Optional :8770 + measured-EE pump (also feeds act_goal_server ee_state).
+        _start_ee_goal_ws()
+        ee_pump_thread = threading.Thread(
+            target=_ee_pump_loop, name="ee_ws_pump", daemon=True
+        )
+        ee_pump_thread.start()
+        arm_mount = config["robot"].get(
+            "policy_arm_base_offset",
+            config["robot"].get("z1_base_in_robot_base", [0.03, 0.0, 0.09]),
+        )
+        vr_goal = ActGoalProvider(act_goal_server, arm_mount_in_base=arm_mount)
+        print(
+            f"[act-ee] ACT duplex WS ws://{args.act_goal_ws_host}:{args.act_goal_ws_port} "
+            "(goals in; measured EE out). Arm tracks ACT after policy YES.",
+            flush=True,
+        )
 
     default_dof = obs_builder.default_dof_pos
     action_scale = config["control"]["action_scale"]
@@ -907,7 +1186,6 @@ def main() -> None:
     lowcmd_writer = None
     z1_writer = None
     hotkeys = None
-    ee_goal_publisher = None
     # Dry run: evaluate policy (no lowcmd). execute: gated by init confirm.
     # arm-only: never send policy leg targets.
     apply_policy = not args.execute_actions
@@ -929,12 +1207,44 @@ def main() -> None:
         async_policy.wait_ready(timeout=120.0)
     except TimeoutError as exc:
         print(f"Error: {exc}")
+        ee_pump_stop.set()
         async_policy.stop()
+        if act_goal_server is not None:
+            act_goal_server.stop()
+        if ee_goal_publisher is not None:
+            ee_goal_publisher.stop()
         vr_goal.stop()
         aggregator.close()
         return
     print(
         "[policy] process worker ready (separate GIL; control process has no Torch).",
+        flush=True,
+    )
+
+    async_obs = ProcessObsWorker(
+        config,
+        control_dt=dt,
+        use_vr=(not bool(args.no_vr)) and (not bool(args.act_ee)),
+        use_act=bool(args.act_ee),
+    )
+    async_obs.start()
+    print("[obs] process worker starting...", flush=True)
+    try:
+        async_obs.wait_ready(timeout=60.0)
+    except TimeoutError as exc:
+        print(f"Error: {exc}")
+        ee_pump_stop.set()
+        async_obs.stop()
+        async_policy.stop()
+        if act_goal_server is not None:
+            act_goal_server.stop()
+        if ee_goal_publisher is not None:
+            ee_goal_publisher.stop()
+        vr_goal.stop()
+        aggregator.close()
+        return
+    print(
+        "[obs] process worker ready (ObservationBuilder in child; own GIL).",
         flush=True,
     )
 
@@ -945,23 +1255,8 @@ def main() -> None:
     signal.signal(signal.SIGINT, _request_shutdown)
     signal.signal(signal.SIGTERM, _request_shutdown)
 
-    stream_cfg = config.get("streaming") or {}
-    if getattr(args, "ee_goal_ws", False):
-        from streaming.ee_goal_ws_server import EeGoalWsServer
-
-        ee_host = args.ee_goal_ws_host or stream_cfg.get("host", "0.0.0.0")
-        ee_port = int(
-            args.ee_goal_ws_port
-            if args.ee_goal_ws_port is not None
-            else stream_cfg.get("port", 8770)
-        )
-        ee_rate = float(
-            args.ee_goal_ws_rate
-            if args.ee_goal_ws_rate is not None
-            else stream_cfg.get("rate_hz", 50.0)
-        )
-        ee_goal_publisher = EeGoalWsServer(host=ee_host, port=ee_port, rate_hz=ee_rate)
-        ee_goal_publisher.start()
+    # Non-ACT paths still start EE WS here (after workers).
+    _start_ee_goal_ws()
 
     def _start_gripper_hotkeys() -> None:
         nonlocal hotkeys
@@ -992,13 +1287,19 @@ def main() -> None:
                 break
             time.sleep(0.05)
         if shutdown["stop"]:
+            async_obs.stop()
             async_policy.stop()
+            if act_goal_server is not None:
+                act_goal_server.stop()
             vr_goal.stop()
             aggregator.close()
             return
         if q_start is None:
             print("Error: no valid B2 state within 30 s; aborting.")
+            async_obs.stop()
             async_policy.stop()
+            if act_goal_server is not None:
+                act_goal_server.stop()
             vr_goal.stop()
             aggregator.close()
             return
@@ -1020,17 +1321,23 @@ def main() -> None:
             print("Releasing sport mode...")
             aggregator.release_motion_mode()
         if not args.legs_only:
-            print("Starting Z1 arm writer (teleop Tdes mode)...")
-            z1_writer = _make_z1_writer(
-                args, aggregator, config, arm_home, dt, control_mode="tdes"
+            arm_mode = "act" if args.act_ee else "tdes"
+            print(
+                f"Starting Z1 arm writer "
+                f"({'ACT arm-base IK' if arm_mode == 'act' else 'teleop Tdes'} mode)..."
             )
-            _start_gripper_hotkeys()
+            z1_writer = _make_z1_writer(
+                args, aggregator, config, arm_home, dt, control_mode=arm_mode
+            )
+            if not args.act_ee:
+                _start_gripper_hotkeys()
 
         apply_policy = run_init_deploy_sequence(
             config=config,
             aggregator=aggregator,
             vr_goal=vr_goal,
             obs_builder=obs_builder,
+            async_obs=async_obs,
             async_policy=async_policy,
             lowcmd_writer=lowcmd_writer,
             z1_writer=z1_writer,
@@ -1042,6 +1349,23 @@ def main() -> None:
             ee_goal_publisher=ee_goal_publisher,
             hotkeys=hotkeys,
         )
+        # ACT EE tracking only after policy YES (arm holds init through ramp/hold).
+        if args.act_ee and apply_policy and hasattr(vr_goal, "set_enabled"):
+            vr_goal.set_enabled(True)
+        elif args.act_ee and not apply_policy:
+            print(
+                "[act-ee] policy not confirmed — ACT EE goals stay disabled; "
+                "arm holds init.",
+                flush=True,
+            )
+    elif args.act_ee:
+        # Dry-run / observe: no init YES — enable ACT EE immediately.
+        print("Starting Z1 arm writer (ACT arm-base IK; legs not commanded)...")
+        z1_writer = _make_z1_writer(
+            args, aggregator, config, arm_home, dt, control_mode="act"
+        )
+        if hasattr(vr_goal, "set_enabled"):
+            vr_goal.set_enabled(True)
 
     # Enable velocity keys on the same stdin listener (space remains gripper-only).
     if args.vel_keyboard and apply_policy and not args.arm_only:
@@ -1050,6 +1374,7 @@ def main() -> None:
 
         def _on_vel(vx: float, vy: float, yaw: float) -> None:
             obs_builder.set_commands(vx, vy, yaw)
+            async_obs.set_commands(vx, vy, yaw)
 
         if hotkeys is None:
             hotkeys = DeployHotkeys(
@@ -1071,11 +1396,13 @@ def main() -> None:
     print("\nB2Z1 WBC deploy")
     print(f"  execute_actions: {args.execute_actions}")
     print(f"  arm_only       : {args.arm_only}")
+    print(f"  act_ee         : {args.act_ee}")
     # Policy net always runs via ProcessPolicyWorker. apply_policy only gates
     # whether leg targets are sent to lowcmd (never for --arm-only).
     print(
-        f"  policy_eval    : process worker every tick "
-        f"(device={(config.get('policy') or {}).get('device', 'cpu')}, "
+        f"  policy_eval    : process workers every tick "
+        f"(obs child + policy device="
+        f"{(config.get('policy') or {}).get('device', 'cpu')}, "
         f"threads={(config.get('policy') or {}).get('num_threads', 1)})"
     )
     print(
@@ -1084,7 +1411,7 @@ def main() -> None:
     )
     print(
         f"  hotkeys        : "
-        f"gripper={'on' if z1_writer is not None else 'off'} "
+        f"gripper={'on' if (z1_writer is not None and not args.act_ee) else 'off'} "
         f"vel={'on' if (hotkeys is not None and hotkeys.enable_vel) else 'off'}"
     )
     if args.execute_actions and not args.arm_only:
@@ -1113,6 +1440,15 @@ def main() -> None:
             f"  arm_gains      : mode={arm_cfg.get('mode', 'jointctrl')} "
             f"{_format_gains('arm', arm_cfg.get('kp', [20, 30, 30, 20, 15, 10]), arm_cfg.get('kd', 2000), 6)}"
         )
+    elif args.act_ee:
+        print(
+            "  arm_control    : ACT arm-base IK "
+            "(ee_goal_local_cart / ee_goal_quat_base + gripper)"
+        )
+        print(
+            f"  ACT goal WS    : ws://{args.act_goal_ws_host}:{args.act_goal_ws_port} "
+            "(online_infer → deploy)"
+        )
     elif args.execute_actions and not args.legs_only:
         print("  arm_control    : Tdes (T_goal = T_init @ inv(Tdes0) @ Tdes)")
     print(f"  checkpoint     : {args.checkpoint}")
@@ -1121,7 +1457,9 @@ def main() -> None:
         "  hard_dof_limit : legs+arm clamped to control.hard_dof_pos_limit "
         f"(elbow {arm_lo[2]:.2f}..{arm_hi[2]:.2f})"
     )
-    if args.no_vr:
+    if args.act_ee:
+        print("  VR server      : disabled (--act-ee; no vr_websocket_server)")
+    elif args.no_vr:
         print("  VR server      : disabled (--no-vr); EE goal held at current pose")
     else:
         print(f"  VR server      : {config['vr']['host']}:{config['vr']['port']}")
@@ -1166,6 +1504,8 @@ def main() -> None:
         "ee_pos": np.full(3, np.nan, dtype=np.float64),
         "ee_quat": np.full(4, np.nan, dtype=np.float64),
     }
+    # Main loop publishes EE; stop the startup pump to avoid double-read.
+    ee_pump_stop.set()
     try:
         while not shutdown["stop"]:
             t0 = time.perf_counter()
@@ -1185,48 +1525,45 @@ def main() -> None:
                         gripper_q=robot.gripper_q,
                         robot=robot,
                         vr_goal=vr_goal,
-                        obs_builder=obs_builder,
+                        obs_builder=None,
                         phase_variable=0.0,
                     )
                 t_arm = time.perf_counter()
 
+                # Arm-only: obs child at 25 Hz for load; arm never waits on build.
                 obs_ms = 0.0
-                if do_print:
+                if do_print or step % 2 == 0:
                     t_ob0 = time.perf_counter()
-                    obs_pack = obs_builder.build(
-                        robot, vr_goal, debug=bool(args.verbose)
+                    obs_pack = async_obs.step(
+                        robot,
+                        _vr_pose_for_obs(vr_goal),
+                        debug=bool(do_print and args.verbose),
                     )
                     _load_sim_obs = np.asarray(
                         obs_pack["obs_vector"], dtype=np.float64
                     ).reshape(-1)
                     _last_obs_pack = obs_pack
                     obs_ms = (time.perf_counter() - t_ob0) * 1000.0
+                    action = async_policy.step(
+                        _load_sim_obs,
+                        action,
+                        clip_actions=clip_actions,
+                        on_action=async_obs.push_action,
+                    )
+                    policy_stage_ms = float(async_policy.last_infer_ms)
                 else:
                     obs_pack = _last_obs_pack
 
-                if do_print or step % 2 == 0:
-                    action = async_policy.step(
-                        _load_sim_obs,
-                        obs_builder,
-                        action,
-                        clip_actions=clip_actions,
-                    )
-                    policy_stage_ms = float(async_policy.last_infer_ms)
-
-                # Every tick: IK goal from z1_writer. Refresh vel/measured EE
-                # from robot (obs pack is only rebuilt at 1 Hz for prints).
-                pub_pack = obs_pack
-                if not do_print:
-                    pub_pack = dict(obs_pack)
-                    pub_pack["base_lin_vel"] = np.asarray(
-                        robot.base_lin_vel_local, dtype=np.float64
-                    ).copy()
-                    pub_pack["ee_pos"] = np.asarray(
-                        robot.ee_pos, dtype=np.float64
-                    ).reshape(3).copy()
-                    pub_pack["ee_quat"] = np.asarray(
-                        robot.ee_quat, dtype=np.float64
-                    ).reshape(4).copy()
+                pub_pack = dict(obs_pack)
+                pub_pack["base_lin_vel"] = np.asarray(
+                    robot.base_lin_vel_local, dtype=np.float64
+                ).copy()
+                pub_pack["ee_pos"] = np.asarray(
+                    robot.ee_pos, dtype=np.float64
+                ).reshape(3).copy()
+                pub_pack["ee_quat"] = np.asarray(
+                    robot.ee_quat, dtype=np.float64
+                ).reshape(4).copy()
                 _maybe_publish_ee(
                     ee_goal_publisher,
                     pub_pack,
@@ -1240,20 +1577,29 @@ def main() -> None:
                     "arm": (t_arm - t_read) * 1000.0,
                     "obs": obs_ms,
                     "policy": policy_stage_ms,
+                    "infer": policy_stage_ms,
+                    "obs_build": float(async_obs.last_build_ms),
                 }
                 teleop_ms = stages_ms["read"] + stages_ms["arm"]
             else:
-                # Full control: fresh obs every tick → async policy → send.
-                # Apply newly ready action immediately (no man-made delay);
-                # if child not done yet, keep previous action for this tick.
-                obs_pack = obs_builder.build(robot, vr_goal, debug=do_print)
+                # Full control: obs + policy in children (non-blocking take).
+                # Parent only packs state / applies last-ready action.
+                if args.act_ee:
+                    vr_goal.update(
+                        robot.ee_pos, robot.ee_quat, robot.base_quat
+                    )
+                    async_obs.set_act_goal(vr_goal.latest_arm_goal())
+                t_ob0 = time.perf_counter()
+                obs_pack = async_obs.step(
+                    robot, _vr_pose_for_obs(vr_goal), debug=do_print
+                )
                 t_obs = time.perf_counter()
 
                 action = async_policy.step(
                     obs_pack["obs_vector"],
-                    obs_builder,
                     action,
                     clip_actions=clip_actions,
+                    on_action=async_obs.push_action,
                 )
                 policy_stage_ms = float(async_policy.last_infer_ms)
                 if apply_policy:
@@ -1267,14 +1613,26 @@ def main() -> None:
                         gripper_q=robot.gripper_q,
                         robot=robot,
                         vr_goal=vr_goal,
-                        obs_builder=obs_builder,
+                        obs_builder=None,
                         phase_variable=obs_pack["phase_variable"],
                     )
                 t_arm = time.perf_counter()
 
+                # Measured EE → ACT (:8771) and optional data_record EE WS (:8770).
+                _publish_measured_ee(robot)
+                pub_pack = dict(obs_pack)
+                pub_pack["base_lin_vel"] = np.asarray(
+                    robot.base_lin_vel_local, dtype=np.float64
+                ).copy()
+                pub_pack["ee_pos"] = np.asarray(
+                    robot.ee_pos, dtype=np.float64
+                ).reshape(3).copy()
+                pub_pack["ee_quat"] = np.asarray(
+                    robot.ee_quat, dtype=np.float64
+                ).reshape(4).copy()
                 _maybe_publish_ee(
                     ee_goal_publisher,
-                    obs_pack,
+                    pub_pack,
                     None if z1_writer is None else z1_writer.gripper_command(),
                     z1_writer=z1_writer,
                 )
@@ -1284,11 +1642,12 @@ def main() -> None:
                 work_ms = (time.perf_counter() - t0) * 1000.0
                 stages_ms = {
                     "read": (t_read - t0) * 1000.0,
-                    "obs": (t_obs - t_read) * 1000.0,
-                    # Parent-side IPC only (child infer is overlapped).
+                    # Parent IPC submit/take only (child build overlapped).
+                    "obs": (t_obs - t_ob0) * 1000.0,
                     "policy": (t_policy_pre - t_obs) * 1000.0,
                     "arm": (t_arm - t_policy_pre) * 1000.0,
                     "infer": policy_stage_ms,
+                    "obs_build": float(async_obs.last_build_ms),
                 }
                 teleop_ms = work_ms
 
@@ -1345,8 +1704,9 @@ def main() -> None:
                             f"(read={max_stages_ms.get('read', 0):.1f} "
                             f"arm={max_stages_ms.get('arm', 0):.1f} "
                             f"ik={ik_ms:.1f} cmd={cmd_ms:.1f} | "
-                            f"obs={max_stages_ms.get('obs', 0):.1f} "
-                            f"ipc={max_stages_ms.get('policy', 0):.1f} "
+                            f"obs_ipc={max_stages_ms.get('obs', 0):.1f} "
+                            f"obs_build={max_stages_ms.get('obs_build', 0):.1f} "
+                            f"pol_ipc={max_stages_ms.get('policy', 0):.1f} "
                             f"infer={max_stages_ms.get('infer', policy_stage_ms):.1f} ms) "
                             f"rss={rss_mb:.0f}MB."
                         )
@@ -1355,8 +1715,9 @@ def main() -> None:
                             f"  loop_lag_hint  : now={teleop_ms:.0f}ms "
                             f"max={max_work_ms:.0f}ms > dt={dt*1000.0:.0f}ms "
                             f"(read={max_stages_ms.get('read', 0):.1f} "
-                            f"obs={max_stages_ms.get('obs', 0):.1f} "
-                            f"ipc={max_stages_ms.get('policy', 0):.1f} "
+                            f"obs_ipc={max_stages_ms.get('obs', 0):.1f} "
+                            f"obs_build={max_stages_ms.get('obs_build', 0):.1f} "
+                            f"pol_ipc={max_stages_ms.get('policy', 0):.1f} "
                             f"infer={max_stages_ms.get('infer', policy_stage_ms):.1f} ms) "
                             f"rss={rss_mb:.0f}MB."
                         )
@@ -1391,9 +1752,9 @@ def main() -> None:
                 if hotkeys is not None and hotkeys.enable_vel:
                     print(
                         f"  keyboard_cmd   : "
-                        f"vx={obs_builder.commands[0]:.2f} "
-                        f"vy={obs_builder.commands[1]:.2f} "
-                        f"yaw={obs_builder.commands[2]:.2f}"
+                        f"vx={async_obs._commands[0]:.2f} "
+                        f"vy={async_obs._commands[1]:.2f} "
+                        f"yaw={async_obs._commands[2]:.2f}"
                     )
 
             step += 1
@@ -1403,8 +1764,12 @@ def main() -> None:
         print("\nStopped.")
     finally:
         _gc.enable()
+        if async_obs is not None:
+            async_obs.stop()
         if async_policy is not None:
             async_policy.stop()
+        if act_goal_server is not None:
+            act_goal_server.stop()
         if hotkeys is not None:
             hotkeys.stop()
         if z1_writer is not None:
@@ -1426,6 +1791,7 @@ def main() -> None:
                 print(f"[safety] Soft shutdown failed ({exc}); stopping lowcmd.", flush=True)
             print("Stopping B2 lowcmd writer (damping)...", flush=True)
             lowcmd_writer.stop()
+        ee_pump_stop.set()
         if ee_goal_publisher is not None:
             ee_goal_publisher.stop()
         vr_goal.stop()

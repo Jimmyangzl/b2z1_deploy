@@ -100,7 +100,12 @@ class EeGoalWsClient:
                 time.sleep(1.0)
 
     async def _consume(self) -> None:
-        async with websockets.connect(self.uri) as websocket:
+        # Fail fast if deploy EE WS is not up yet (common while policy loads).
+        try:
+            ws_cm = websockets.connect(self.uri, open_timeout=3)
+        except TypeError:
+            ws_cm = websockets.connect(self.uri)
+        async with ws_cm as websocket:
             print(f"[EeGoalWsClient] connected to {self.uri}", flush=True)
             while not self._stop.is_set():
                 try:

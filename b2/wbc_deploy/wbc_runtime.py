@@ -252,16 +252,24 @@ def load_runtime(
     rate = float(args.rate if args.rate is not None else config["control"]["rate_hz"])
     dt = 1.0 / rate
 
-    use_vr = not getattr(args, "no_vr", False)
-    # With VR + robot prep: defer Z1 UDP until the websocket client connects
-    # (prep releases on first client). Matches teleop_z1_vive_ws startup order.
-    defer_z1_loop = use_vr
+    use_act = bool(getattr(args, "act_ee", False))
+    use_vr = (not getattr(args, "no_vr", False)) and (not use_act)
+    # With VR/ACT prep: defer Z1 UDP until prep releases (avoid two ArmInterfaces).
+    defer_z1_loop = use_vr or use_act
 
     aggregator = RobotStateAggregator(config)
     release_now = not args.no_release_mode and not defer_release
     aggregator.initialize(release_motion_mode=release_now, start_z1_loop=not defer_z1_loop)
 
-    if not use_vr:
+    if use_act:
+        # Replaced in deploy_wbc after Z1RobotPrep + ActGoalWsServer start.
+        vr_goal = NullVrGoalProvider()
+        print(
+            "[load_runtime] ACT EE mode: Z1 loop deferred until arm_init prep "
+            "+ ActGoalWsServer.",
+            flush=True,
+        )
+    elif not use_vr:
         vr_goal = NullVrGoalProvider()
     else:
         arm_mount = config["robot"].get(
@@ -594,18 +602,26 @@ class ProcessPolicyWorker:
     def step(
         self,
         obs_vector: np.ndarray,
-        obs_builder,
         action: np.ndarray,
         *,
         clip_actions: float,
+        on_action=None,
     ) -> np.ndarray:
-        """Submit fresh obs; apply newly ready action immediately if available."""
+        """Submit fresh obs; apply newly ready action immediately if available.
+
+        ``on_action(leg)`` is optional (e.g. ProcessObsWorker.push_action) so
+        action history lives in the obs child, not the control process.
+        """
         self.submit(obs_vector)
         ready = self.take_action()
         if ready is not None:
-            return obs_builder.update_action_history(
-                ready, clip_actions=clip_actions
-            )
+            leg = np.asarray(ready, dtype=np.float64).reshape(-1)[:12].copy()
+            if clip_actions is not None and float(clip_actions) > 0.0:
+                c = float(clip_actions)
+                leg = np.clip(leg, -c, c)
+            if on_action is not None:
+                on_action(leg)
+            return leg
         return action
 
 

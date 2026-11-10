@@ -139,8 +139,8 @@ streaming:
 
 # WBC policy checkpoint (.pt). Optional if passed via --checkpoint on the CLI.
 policy:
-  # checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy-small-step/model_30000.pt
-  checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy-small-step/model_32000.pt
+  # checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy-small-step/model_40000.pt
+  checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy-small-step/model_36000.pt
   # checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy/model_48000.pt
   # checkpoint: /home/jimmyyang/unitree_deploy/b2z1_deploy/b2/wbc_deploy/wbc_ckpt/b2z1-wbc-deploy/model_100000.pt
   # checkpoint: null
@@ -175,16 +175,6 @@ init_deploy_joint:
   # RR: [0.1,  0.9, -1.8]
 
 
-  # FL: [2.2980e-02,  6.9664e-01, -1.6319e+00]
-  # FR: [9.0408e-02,  6.8347e-01, -1.6360e+00]
-  # RL: [1.1369e-02,  6.6347e-01, -1.4966e+00,]
-  # RR: [-3.3321e-02,  7.0714e-01, -1.4326e+00]
-
-  # FL: [-4.3536e-02,  4.9689e-01, -1.7700e+00]
-  # FR: [7.3769e-02,  3.9787e-01, -1.7795e+00]
-  # RL: [-1.8644e-02,  3.5985e-01, -1.1335e+00]
-  # RR: [1.3925e-02,  4.0896e-01, -1.1811e+00]
-
   # FL: [3.2037e-02,  6.2553e-01, -1.2391e+00]
   # FR: [2.9064e-02,  6.3741e-01, -1.3059e+00]
   # RL: [-1.6031e-02,  7.4089e-01, -1.0673e+00]
@@ -195,11 +185,21 @@ init_deploy_joint:
   # RL: [-8.9532e-03,  7.7619e-01, -1.0553e+00]
   # RR: [-4.2915e-03,  6.6486e-01, -1.0597e+00]
 
-  FL: [3.1949e-02,  6.2554e-01, -1.2391e+00]
-  FR: [2.8984e-02,  6.3733e-01, -1.3057e+00]
-  RL: [-1.5971e-02,  7.4094e-01, -1.0673e+00]
-  RR: [-1.8461e-02,  6.4981e-01, -1.1549e+00]
 
+  # FL: [0.0744,  0.5245, -1.5860]
+  # FR: [-0.0762,  0.5472, -1.5591]
+  # RL: [0.0330,  0.6637, -1.2591]
+  # RR: [-0.0382,  0.5722, -1.2421]
+
+  # FL: [0.0465,  0.6120, -1.7264]
+  # FR: [-0.0572,  0.6309, -1.7018]
+  # RL: [0.0226,  0.5909, -1.2538]
+  # RR: [-0.0139,  0.5167, -1.2519]
+
+  FL: [0.0707,  0.5413, -1.6808]
+  FR: [-0.0524,  0.5059, -1.6614]
+  RL: [-0.0089,  0.5824, -1.2678]
+  RR: [-0.0134,  0.4926, -1.2457]
 
 
 init_deploy_ramp_s: 5.0
