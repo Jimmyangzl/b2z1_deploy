@@ -1491,6 +1491,14 @@ def main() -> None:
     # for prints and feed the child a cached vector at 25 Hz for load only.
     # Full control: fresh obs every tick (no cache).
     _load_sim_obs = np.zeros(_num_observations, dtype=np.float64)
+    # robot.ee_pos is robot-base (mount + FK); recorded/IK goals are arm-base.
+    _arm_mount = np.asarray(
+        config["robot"].get(
+            "policy_arm_base_offset",
+            config["robot"]["z1_base_in_robot_base"],
+        ),
+        dtype=np.float64,
+    ).reshape(3)
     _last_obs_pack = {
         "phase_variable": 0.0,
         "obs_vector": _load_sim_obs,
@@ -1554,13 +1562,16 @@ def main() -> None:
                 else:
                     obs_pack = _last_obs_pack
 
+                # Refresh vel/measured EE every tick. Subtract mount so ee_pos
+                # is arm-base (matches IK goal), not robot-base.
                 pub_pack = dict(obs_pack)
                 pub_pack["base_lin_vel"] = np.asarray(
                     robot.base_lin_vel_local, dtype=np.float64
                 ).copy()
-                pub_pack["ee_pos"] = np.asarray(
-                    robot.ee_pos, dtype=np.float64
-                ).reshape(3).copy()
+                pub_pack["ee_pos"] = (
+                    np.asarray(robot.ee_pos, dtype=np.float64).reshape(3)
+                    - _arm_mount
+                )
                 pub_pack["ee_quat"] = np.asarray(
                     robot.ee_quat, dtype=np.float64
                 ).reshape(4).copy()
@@ -1624,9 +1635,10 @@ def main() -> None:
                 pub_pack["base_lin_vel"] = np.asarray(
                     robot.base_lin_vel_local, dtype=np.float64
                 ).copy()
-                pub_pack["ee_pos"] = np.asarray(
-                    robot.ee_pos, dtype=np.float64
-                ).reshape(3).copy()
+                pub_pack["ee_pos"] = (
+                    np.asarray(robot.ee_pos, dtype=np.float64).reshape(3)
+                    - _arm_mount
+                )
                 pub_pack["ee_quat"] = np.asarray(
                     robot.ee_quat, dtype=np.float64
                 ).reshape(4).copy()
