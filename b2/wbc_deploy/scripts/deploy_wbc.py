@@ -238,7 +238,7 @@ class Z1ArmWriter:
         self._ftip_zero = np.zeros(6, dtype=np.float64)
         # Binary gripper: closed=0, open=-1 (space toggles). Observed polarity.
         self.gripper_closed = 0.0
-        self.gripper_open = -1.0
+        self.gripper_open = -0.5
         self._gripper_pos = float(self.gripper_closed)
         self._gripper_lock = threading.Lock()
         self._homing = False
