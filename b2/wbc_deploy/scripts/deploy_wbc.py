@@ -1593,17 +1593,33 @@ def main() -> None:
                 }
                 teleop_ms = stages_ms["read"] + stages_ms["arm"]
             else:
-                # Full control: obs + policy in children (non-blocking take).
-                # Parent only packs state / applies last-ready action.
+                # Full control: command arm *before* obs IPC so a stuck
+                # Array lock / scheduler delay cannot stall VR Tdes / ACT IK.
+                # Legs still use this tick's obs+policy (after arm).
                 if args.act_ee:
                     vr_goal.update(
                         robot.ee_pos, robot.ee_quat, robot.base_quat
                     )
                     async_obs.set_act_goal(vr_goal.latest_arm_goal())
+
+                t_arm0 = time.perf_counter()
+                if z1_writer is not None:
+                    z1_writer.send(
+                        gripper_q=robot.gripper_q,
+                        robot=robot,
+                        vr_goal=vr_goal,
+                        obs_builder=None,
+                        phase_variable=float(
+                            _last_obs_pack.get("phase_variable", 0.0)
+                        ),
+                    )
+                t_arm = time.perf_counter()
+
                 t_ob0 = time.perf_counter()
                 obs_pack = async_obs.step(
                     robot, _vr_pose_for_obs(vr_goal), debug=do_print
                 )
+                _last_obs_pack = obs_pack
                 t_obs = time.perf_counter()
 
                 action = async_policy.step(
@@ -1617,17 +1633,7 @@ def main() -> None:
                     leg_q_target = leg_targets_from_action(
                         action, default_dof, action_scale, clip_actions=clip_actions
                     )
-                t_policy_pre = time.perf_counter()
-
-                if z1_writer is not None:
-                    z1_writer.send(
-                        gripper_q=robot.gripper_q,
-                        robot=robot,
-                        vr_goal=vr_goal,
-                        obs_builder=None,
-                        phase_variable=obs_pack["phase_variable"],
-                    )
-                t_arm = time.perf_counter()
+                t_policy = time.perf_counter()
 
                 # Measured EE → ACT (:8771) and optional data_record EE WS (:8770).
                 _publish_measured_ee(robot)
@@ -1654,23 +1660,25 @@ def main() -> None:
                 work_ms = (time.perf_counter() - t0) * 1000.0
                 stages_ms = {
                     "read": (t_read - t0) * 1000.0,
+                    "arm": (t_arm - t_arm0) * 1000.0,
                     # Parent IPC submit/take only (child build overlapped).
                     "obs": (t_obs - t_ob0) * 1000.0,
-                    "policy": (t_policy_pre - t_obs) * 1000.0,
-                    "arm": (t_arm - t_policy_pre) * 1000.0,
+                    "policy": (t_policy - t_obs) * 1000.0,
                     "infer": policy_stage_ms,
                     "obs_build": float(async_obs.last_build_ms),
                 }
-                teleop_ms = work_ms
+                # Arm-critical path for lag hints (exclude obs/policy stalls).
+                teleop_ms = stages_ms["read"] + stages_ms["arm"]
 
-            if teleop_ms >= max_work_ms:
-                max_work_ms = teleop_ms
+            # Track worst full tick (work_ms); arm-only teleop_ms == critical path.
+            _tick_ms = teleop_ms if args.arm_only else work_ms
+            if _tick_ms >= max_work_ms:
+                max_work_ms = _tick_ms
                 max_stages_ms = dict(stages_ms)
             if z1_writer is not None:
-                # For arm-only, loop_ms = arm-critical path (read+arm), not obs.
-                z1_writer._last_status["loop_ms"] = (
-                    teleop_ms if args.arm_only else work_ms
-                )
+                # Arm-critical path for status; full tick still in work_ms stages.
+                z1_writer._last_status["loop_ms"] = teleop_ms
+                z1_writer._last_status["work_ms"] = work_ms
 
             # Cap print rate: at most 1 Hz for status (do_print computed pre-build).
             if do_print:
