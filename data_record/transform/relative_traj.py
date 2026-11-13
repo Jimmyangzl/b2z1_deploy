@@ -26,6 +26,9 @@ _NAN_GATE_FIELDS = (
     "gripper_cmd",
 )
 
+# Always loaded / copied through; warn if absent or empty.
+_REQUIRED_FIELDS = ("timestamp", "rgb") + _NAN_GATE_FIELDS
+
 
 def quat_conjugate(q: np.ndarray) -> np.ndarray:
     out = np.asarray(q, dtype=np.float64).copy()
@@ -74,14 +77,30 @@ def quat_rotate_inverse(q: np.ndarray, v: np.ndarray) -> np.ndarray:
     return a - b + c
 
 
+def report_missing_fields(data: Dict[str, np.ndarray]) -> List[str]:
+    """Return reports for required keys that are absent or empty."""
+    reports: List[str] = []
+    for name in _REQUIRED_FIELDS:
+        if name not in data or data[name] is None:
+            reports.append(f"{name}: missing from episode")
+            continue
+        arr = np.asarray(data[name])
+        if arr.size == 0:
+            reports.append(f"{name}: empty array")
+    return reports
+
+
 def report_nan_fields(data: Dict[str, np.ndarray]) -> List[str]:
     """Return human-readable NaN reports for gated fields. Empty ⇒ clean."""
     reports: List[str] = []
     for name in _NAN_GATE_FIELDS:
-        if name not in data:
+        if name not in data or data[name] is None:
             reports.append(f"{name}: missing from episode")
             continue
         arr = np.asarray(data[name])
+        if arr.size == 0:
+            reports.append(f"{name}: empty array")
+            continue
         bad = ~np.isfinite(arr)
         if not bad.any():
             continue
@@ -93,9 +112,48 @@ def report_nan_fields(data: Dict[str, np.ndarray]) -> List[str]:
             idxs = np.flatnonzero(row_bad)
         preview = idxs[:10].tolist()
         more = "" if idxs.size <= 10 else f" … (+{idxs.size - 10} more)"
+        if idxs.size == arr.shape[0]:
+            reports.append(
+                f"{name}: ALL {idxs.size} frames non-finite (signal missing)"
+            )
+        else:
+            reports.append(
+                f"{name}: {idxs.size}/{arr.shape[0]} non-finite frame(s) "
+                f"at indices {preview}{more}"
+            )
+    return reports
+
+
+def report_rgb_gaps(data: Dict[str, np.ndarray]) -> List[str]:
+    """Warn on blank / non-finite RGB frames (does not fail the NaN gate alone)."""
+    if "rgb" not in data or data["rgb"] is None:
+        return ["rgb: missing from episode"]
+    rgb = np.asarray(data["rgb"])
+    if rgb.size == 0:
+        return ["rgb: empty array"]
+    if rgb.ndim != 4 or rgb.shape[-1] != 3:
+        return [f"rgb: unexpected shape {rgb.shape}"]
+    reports: List[str] = []
+    finite = np.isfinite(rgb.astype(np.float64))
+    row_bad = (~finite.reshape(rgb.shape[0], -1)).any(axis=1)
+    if row_bad.any():
+        idxs = np.flatnonzero(row_bad)
+        preview = idxs[:10].tolist()
+        more = "" if idxs.size <= 10 else f" … (+{idxs.size - 10} more)"
         reports.append(
-            f"{name}: {idxs.size}/{arr.shape[0]} non-finite frame(s) "
+            f"rgb: {idxs.size}/{rgb.shape[0]} non-finite frame(s) "
             f"at indices {preview}{more}"
+        )
+    # All-zero frames usually mean camera stale / disconnected during record.
+    means = rgb.reshape(rgb.shape[0], -1).mean(axis=1)
+    blank = means <= 1.0
+    if blank.any():
+        idxs = np.flatnonzero(blank)
+        preview = idxs[:10].tolist()
+        more = "" if idxs.size <= 10 else f" … (+{idxs.size - 10} more)"
+        reports.append(
+            f"rgb: {idxs.size}/{rgb.shape[0]} near-black frame(s) "
+            f"(mean<=1) at indices {preview}{more}"
         )
     return reports
 
@@ -208,11 +266,31 @@ def transform_episode_arrays(
     """Return relative-traj arrays, or ``None`` if NaN gate fails.
 
     On failure, prints a report for the caller to attribute to an episode path.
+    Always prints ``WARNING`` lines for missing / non-finite gated signals and
+    for blank RGB frames (RGB blanks warn but only fail the gate if rgb is
+    missing/empty/non-finite as reported by :func:`report_missing_fields`).
     """
-    reports = report_nan_fields(data)
-    if reports:
-        for line in reports:
-            print(f"  NaN gate: {line}", flush=True)
+    missing = report_missing_fields(data)
+    nan_reports = report_nan_fields(data)
+    rgb_reports = report_rgb_gaps(data)
+
+    for line in missing:
+        print(f"  WARNING: {line}", flush=True)
+    for line in nan_reports:
+        # Avoid duplicate "missing" lines already covered above.
+        if line.endswith("missing from episode") and any(
+            m.startswith(line.split(":", 1)[0]) for m in missing
+        ):
+            continue
+        print(f"  WARNING: {line}", flush=True)
+    for line in rgb_reports:
+        if line.endswith("missing from episode") and any(
+            m.startswith("rgb:") for m in missing
+        ):
+            continue
+        print(f"  WARNING: {line}", flush=True)
+
+    if missing or nan_reports:
         return None
 
     rate = float(record_rate_hz)

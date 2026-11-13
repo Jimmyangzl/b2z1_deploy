@@ -2,7 +2,7 @@
 
 Records synchronized sessions to HDF5 on the **recording laptop**:
 
-- RGB from Intel RealSense D435i → `(N, 480, 640, 3)` uint8
+- RGB from Intel RealSense D435i → `(N, H, W, 3)` uint8 (size from camera / `record.yaml`)
 - `ee_goal_local_cart` / `ee_goal_quat_base` = arm IK target pose in **arm-base**
   (`T_goal` from `deploy_wbc` tdes/wbc control), via WBC WebSocket
 - B2 `base_quat` + `base_lin_vel_local` via DDS on the robot Ethernet
@@ -39,6 +39,21 @@ python scripts/deploy_wbc.py --interface enp8s0 --ee-goal-ws \
 
 3. On the **recording** laptop (same robot Ethernet as B2):
 
+Optional — run the camera in its own process (keeps RealSense warm; frames via shared memory, WS hello only):
+
+```bash
+cd ~/unitree_ws/b2z1_deploy/data_record
+python scripts/camera_ws_server.py --host 127.0.0.1 --port 8772 --rate 15 --camera-backend realsense
+```
+
+Preview (second terminal; press `q` to quit). On Wayland, force xcb if the window flash-closes:
+
+```bash
+QT_QPA_PLATFORM=xcb python scripts/view_camera_ws.py --host 127.0.0.1 --port 8772 --exposure-hint
+```
+
+Then record (direct camera if you omit `--camera-ws-*`):
+
 ```bash
 cd ~/unitree_deploy/b2z1_deploy/data_record
 python scripts/record_session.py \
@@ -46,6 +61,8 @@ python scripts/record_session.py \
   --interface enp8s0 \
   --ee-ws-host <WBC_LAPTOP_IP> \
   --ee-ws-port 8770 \
+  --camera-ws-host 127.0.0.1 \
+  --camera-ws-port 8772 \
   --rate 20
 ```
 
@@ -73,7 +90,7 @@ python scripts/record_session.py --task task_1 --no-b2 --no-ee --rate 20
 | Dataset | Shape | Notes |
 |---------|-------|-------|
 | `timestamp` | `(N,)` | Recorder wall time (s) |
-| `rgb` | `(N, 480, 640, 3)` | RGB uint8 |
+| `rgb` | `(N, H, W, 3)` | RGB uint8 (H/W from capture) |
 | `ee_goal_local_cart` | `(N, 3)` | IK EE goal position in arm-base (`T_goal`). NaN if stale/missing |
 | `ee_goal_quat_base` | `(N, 4)` | IK EE goal orientation, wxyz, arm-base frame. NaN if stale/missing |
 | `ee_pos` | `(N, 3)` | Measured EE position, arm-base frame. NaN if arm disconnected or stale |

@@ -91,19 +91,31 @@ def _list_episodes(task_dir: str, episode: Optional[int]) -> List[str]:
     return paths
 
 
+_LOAD_KEYS = (
+    "timestamp",
+    "rgb",
+    "ee_goal_local_cart",
+    "ee_goal_quat_base",
+    "ee_pos",
+    "ee_quat",
+    "base_lin_vel_local",
+    "base_quat",
+    "gripper_cmd",
+)
+
+
 def _load_episode(path: str) -> Tuple[Dict, dict]:
     with h5py.File(path, "r") as f:
-        data = {
-            "timestamp": f["timestamp"][:],
-            "rgb": f["rgb"][:],
-            "ee_goal_local_cart": f["ee_goal_local_cart"][:],
-            "ee_goal_quat_base": f["ee_goal_quat_base"][:],
-            "ee_pos": f["ee_pos"][:],
-            "ee_quat": f["ee_quat"][:],
-            "base_lin_vel_local": f["base_lin_vel_local"][:],
-            "base_quat": f["base_quat"][:],
-            "gripper_cmd": f["gripper_cmd"][:],
-        }
+        data = {}
+        for key in _LOAD_KEYS:
+            if key not in f:
+                print(
+                    f"  WARNING: dataset '{key}' missing in {os.path.basename(path)}",
+                    flush=True,
+                )
+                data[key] = None
+            else:
+                data[key] = f[key][:]
         attrs = {k: f.attrs[k] for k in f.attrs}
     return data, attrs
 
@@ -204,7 +216,8 @@ def main() -> int:
         )
         if out is None:
             print(
-                f"[make_relative_traj] SKIP {name}: NaN present — not writing {dst}",
+                f"[make_relative_traj] WARNING: SKIP {name} "
+                f"(missing/non-finite signal) — not writing {dst}",
                 flush=True,
             )
             n_skip += 1

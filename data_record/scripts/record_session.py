@@ -25,6 +25,7 @@ if os.path.isdir(_B2_SDK) and _B2_SDK not in sys.path:
     sys.path.insert(0, _B2_SDK)
 
 from camera.realsense_rgb import RealSenseRGB
+from camera.rgb_ws_client import RgbWsClient
 from net.ee_goal_ws_client import EeGoalWsClient
 from robot.b2_dds_reader import B2DdsReader
 from storage.h5_writer import H5SessionWriter
@@ -117,7 +118,19 @@ def main() -> int:
         "--camera-backend",
         choices=("auto", "realsense", "v4l"),
         default="auto",
-        help="RGB capture backend (auto falls back to V4L if librealsense fails)",
+        help="RGB capture backend when not using --camera-ws-* "
+        "(auto falls back to V4L if librealsense fails)",
+    )
+    parser.add_argument(
+        "--camera-ws-host",
+        default=None,
+        help="If set, read RGB from camera_ws_server instead of opening the device",
+    )
+    parser.add_argument(
+        "--camera-ws-port",
+        type=int,
+        default=None,
+        help="Camera WS port (default from yaml camera_ws.port / 8772)",
     )
     args = parser.parse_args()
 
@@ -126,6 +139,7 @@ def main() -> int:
     rec = cfg.get("record") or {}
     ee_cfg = cfg.get("ee_goal_ws") or {}
     cam_cfg = cfg.get("camera") or {}
+    cam_ws_cfg = cfg.get("camera_ws") or {}
 
     interface = args.interface or net.get("interface", "enp8s0")
     sport_topic = net.get("sport_topic", "rt/lf/sportmodestate")
@@ -137,6 +151,17 @@ def main() -> int:
     height = int(cam_cfg.get("height", 480))
     cam_fps = int(cam_cfg.get("fps", 30))
     cam_serial = cam_cfg.get("serial")
+    cam_ws_host = args.camera_ws_host
+    if cam_ws_host is None:
+        cam_ws_host = cam_ws_cfg.get("host")
+    if cam_ws_host is not None:
+        cam_ws_host = str(cam_ws_host).strip() or None
+    cam_ws_port = int(
+        args.camera_ws_port
+        if args.camera_ws_port is not None
+        else cam_ws_cfg.get("port", 8772)
+    )
+    cam_ws_stale_s = float(cam_ws_cfg.get("stale_s", 1.0))
 
     try:
         out_path, episode_idx = _resolve_out_path(
@@ -173,15 +198,31 @@ def main() -> int:
             b2.start()
 
         if not args.no_camera:
-            camera = RealSenseRGB(
-                width=width,
-                height=height,
-                fps=cam_fps,
-                serial=cam_serial,
-                backend=args.camera_backend,
-            )
-            camera.start()
-            cam_serial_used = camera.serial or ""
+            if cam_ws_host:
+                camera = RgbWsClient(
+                    host=cam_ws_host,
+                    port=cam_ws_port,
+                    width=width,
+                    height=height,
+                    stale_s=cam_ws_stale_s,
+                )
+                camera.start()
+                # SHM hello may advertise a different size than yaml (e.g. 320x180).
+                width = int(camera.width)
+                height = int(camera.height)
+                cam_serial_used = camera.serial or f"ws://{cam_ws_host}:{cam_ws_port}"
+            else:
+                camera = RealSenseRGB(
+                    width=width,
+                    height=height,
+                    fps=cam_fps,
+                    serial=cam_serial,
+                    backend=args.camera_backend,
+                )
+                camera.start()
+                width = int(camera.width)
+                height = int(camera.height)
+                cam_serial_used = camera.serial or ""
         else:
             cam_serial_used = "none"
 

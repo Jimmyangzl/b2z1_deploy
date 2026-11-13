@@ -17,6 +17,22 @@ ee_goal_ws:
 camera:
   # Leave serial null to use the first connected RealSense.
   serial: null
-  width: 640
-  height: 480
+  # Frame size dominates SHM bandwidth (raw RGB ≈ W*H*3 bytes/frame).
+  # D435i color: 640x480@15/30, 424x240@15/30, 320x180@30/60 (no 15 Hz).
+  width: 320
+  height: 180
   fps: 30
+  # Manual color exposure (AE off — AE caused multi-second USB stalls).
+  # D435i exposure is in microseconds; gain is unitless sensor gain.
+  # Dark room: raise exposure_us (e.g. 3000–8000) and/or gain (e.g. 32–64).
+  # Bright/washed out: lower exposure_us (e.g. 300–800) or gain.
+  exposure_us: 1000
+  gain: 16
+
+# Optional separate camera process (raw RGB over localhost WebSocket).
+# Leave host null/empty to open the camera inside record_session (default).
+camera_ws:
+  host: null          # e.g. 127.0.0.1 when using scripts/camera_ws_server.py
+  port: 8772
+  rate_hz: 30.0
+  stale_s: 1.0
