@@ -322,15 +322,23 @@ def _obs_process_entry(
     in_scratch = _np.zeros(_IN_FLOATS, dtype=_np.float64)
     out_scratch = _np.zeros(_OUT_FLOATS, dtype=_np.float64)
     last = -1
+    in_lock = in_arr.get_lock()
     while not stop_evt.is_set():
         with seq.get_lock():
             cur = int(seq.value)
         if cur == last:
             _time.sleep(0.0005)
             continue
-        last = cur
-        with in_arr.get_lock():
+        # Non-blocking read: if parent holds the lock, retry without advancing
+        # last so we still consume this seq once the lock is free.
+        if not in_lock.acquire(False):
+            _time.sleep(0.0005)
+            continue
+        try:
             in_scratch[:] = _np.frombuffer(in_arr.get_obj(), dtype=_np.float64)
+        finally:
+            in_lock.release()
+        last = cur
 
         if in_scratch[_IN_RESET] > 0.5:
             builder.reset()
@@ -516,7 +524,12 @@ class ProcessObsWorker:
         """Arm-base ACT goal for the next obs build (hold-last if None)."""
         self._pending_act_goal = act_goal
 
-    def submit(self, robot, vr_pose: Optional[dict] = None, *, debug: bool = False) -> None:
+    def submit(self, robot, vr_pose: Optional[dict] = None, *, debug: bool = False) -> bool:
+        """Pack robot state into SHM. Non-blocking: returns False if lock busy.
+
+        Pending action/reset are only cleared after a successful publish so a
+        contended tick does not drop them.
+        """
         buf = np.zeros(_IN_FLOATS, dtype=np.float64)
         _pack_robot(buf, robot)
         if vr_pose is not None:
@@ -524,13 +537,13 @@ class ProcessObsWorker:
         buf[_IN_DEBUG] = 1.0 if debug else 0.0
         buf[_IN_USE_CMD] = 1.0 if self._use_cmd else 0.0
         buf[_IN_CMD : _IN_CMD + 3] = self._commands
-        if self._pending_action is not None:
+        has_action = self._pending_action is not None
+        if has_action:
             buf[_IN_HAS_ACTION] = 1.0
             buf[_IN_ACTION : _IN_ACTION + 12] = self._pending_action
-            self._pending_action = None
-        if self._pending_reset:
+        do_reset = bool(self._pending_reset)
+        if do_reset:
             buf[_IN_RESET] = 1.0
-            self._pending_reset = False
         if self._use_act and self._pending_act_goal is not None:
             g = self._pending_act_goal
             buf[_IN_HAS_ACT] = 1.0
@@ -541,19 +554,51 @@ class ProcessObsWorker:
                 g["ee_goal_quat_base"], dtype=np.float64
             ).reshape(4)
             buf[_IN_ACT_GRIP] = float(g.get("gripper_cmd", 0.0))
-        with self._in.get_lock():
+
+        in_lock = self._in.get_lock()
+        if not in_lock.acquire(False):
+            return False
+        try:
             np.frombuffer(self._in.get_obj(), dtype=np.float64)[:] = buf
-        with self._seq.get_lock():
+        finally:
+            in_lock.release()
+
+        seq_lock = self._seq.get_lock()
+        if not seq_lock.acquire(False):
+            # Input written but seq not bumped; next successful submit overwrites.
+            return False
+        try:
             self._seq.value += 1
+        finally:
+            seq_lock.release()
+
+        if has_action:
+            self._pending_action = None
+        if do_reset:
+            self._pending_reset = False
+        return True
 
     def take(self) -> Optional[Dict[str, Any]]:
-        with self._done_seq.get_lock():
+        """Non-blocking SHM read. Returns None if lock busy or no new pack."""
+        done_lock = self._done_seq.get_lock()
+        if not done_lock.acquire(False):
+            return None
+        try:
             done = int(self._done_seq.value)
+        finally:
+            done_lock.release()
         if done <= self._last_taken:
             return None
-        self._last_taken = done
-        with self._out.get_lock():
+
+        out_lock = self._out.get_lock()
+        if not out_lock.acquire(False):
+            # Do not advance _last_taken — retry this pack next tick.
+            return None
+        try:
             out = np.frombuffer(self._out.get_obj(), dtype=np.float64).copy()
+        finally:
+            out_lock.release()
+        self._last_taken = done
         self.last_build_ms = float(out[_OUT_BUILD_MS])
         obs_vector = out[_OUT_OBS : _OUT_OBS + num_observations].copy()
         proprio = out[_OUT_PROPRIO : _OUT_PROPRIO + num_proprio].copy()
@@ -585,8 +630,8 @@ class ProcessObsWorker:
         self, robot, vr_pose: Optional[dict] = None, *, debug: bool = False
     ) -> Dict[str, Any]:
         """Submit and return newest ready pack (or last pack / empty stub)."""
-        self.submit(robot, vr_pose, debug=debug)
-        self._submit_count += 1
+        if self.submit(robot, vr_pose, debug=debug):
+            self._submit_count += 1
         ready = self.take()
         if ready is not None:
             self._warned_stale = False

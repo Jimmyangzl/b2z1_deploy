@@ -19,6 +19,7 @@ import signal
 import sys
 import threading
 import time
+from dataclasses import replace
 from typing import Optional, Tuple
 
 import numpy as np
@@ -39,6 +40,7 @@ from unitree_sdk2py.utils.crc import CRC
 from unitree_sdk2py.utils.thread import RecurrentThread
 
 from state.leg_dof_mapping import motor_legs_to_sim, sim_legs_to_motor
+from state.robot_state import RobotState
 from commands.vel_keyboard import DeployHotkeys
 from control.dof_limits import clip_dof_pos, load_leg_arm_limit_arrays
 from control.gains import GainLike, as_gain_vector
@@ -52,6 +54,41 @@ from wbc_runtime import (
     load_runtime,
     print_obs_summary,
 )
+
+
+def _raise_control_priority() -> None:
+    """Prefer the 50 Hz control process over policy/VR siblings and UI.
+
+    Call *after* child workers start so they keep default nice. Tries nice(-10),
+    then nice(-5), then SCHED_FIFO if permitted.
+    """
+    nice_ok = False
+    for delta in (-10, -5):
+        try:
+            os.nice(delta)
+            print(
+                f"[sched] control process nice{delta:+d} (pid={os.getpid()}).",
+                flush=True,
+            )
+            nice_ok = True
+            break
+        except (PermissionError, OSError):
+            continue
+    if not nice_ok:
+        print(
+            "[sched] nice(-10/-5) needs privilege; "
+            "try: sudo setcap 'cap_sys_nice=eip' "
+            "$(readlink -f $(which python))",
+            flush=True,
+        )
+    # Soft RT if allowed — modest priority so we cannot lock out the kernel.
+    try:
+        param = os.sched_param(10)
+        os.sched_setscheduler(0, os.SCHED_FIFO, param)
+        print("[sched] SCHED_FIFO priority=10 enabled.", flush=True)
+    except (AttributeError, PermissionError, OSError) as exc:
+        kind = "nice applied" if nice_ok else "default priority"
+        print(f"[sched] SCHED_FIFO unavailable ({exc}); {kind}.", flush=True)
 
 
 def _maybe_publish_ee(publisher, obs_pack: dict, gripper_cmd=None, z1_writer=None) -> None:
@@ -238,7 +275,7 @@ class Z1ArmWriter:
         self._ftip_zero = np.zeros(6, dtype=np.float64)
         # Binary gripper: closed=0, open=-1 (space toggles). Observed polarity.
         self.gripper_closed = 0.0
-        self.gripper_open = -0.5
+        self.gripper_open = -0.8
         self._gripper_pos = float(self.gripper_closed)
         self._gripper_lock = threading.Lock()
         self._homing = False
@@ -691,6 +728,123 @@ class Z1ArmWriter:
         self._last_status["arm_ik_ms"] = (t_ik - t_send0) * 1000.0
         self._last_status["arm_cmd_ms"] = (t_cmd - t_ik) * 1000.0
 
+
+def _copy_robot_for_arm(robot: RobotState) -> RobotState:
+    """Array-deep copy so the async arm thread is not racing aggregator.read()."""
+    jac = robot.jacobian
+    return replace(
+        robot,
+        base_quat=np.asarray(robot.base_quat, dtype=np.float64).copy(),
+        base_lin_vel_local=np.asarray(
+            robot.base_lin_vel_local, dtype=np.float64
+        ).copy(),
+        base_ang_vel_local=np.asarray(
+            robot.base_ang_vel_local, dtype=np.float64
+        ).copy(),
+        leg_q=np.asarray(robot.leg_q, dtype=np.float64).copy(),
+        leg_dq=np.asarray(robot.leg_dq, dtype=np.float64).copy(),
+        arm_q=np.asarray(robot.arm_q, dtype=np.float64).copy(),
+        arm_dq=np.asarray(robot.arm_dq, dtype=np.float64).copy(),
+        ee_pos=np.asarray(robot.ee_pos, dtype=np.float64).copy(),
+        ee_quat=np.asarray(robot.ee_quat, dtype=np.float64).copy(),
+        foot_contacts=np.asarray(robot.foot_contacts).copy(),
+        projected_gravity=np.asarray(
+            robot.projected_gravity, dtype=np.float64
+        ).copy(),
+        jacobian=(
+            None if jac is None else np.asarray(jac, dtype=np.float64).copy()
+        ),
+    )
+
+
+class AsyncZ1ArmPump:
+    """Keep-latest Z1 IK/cmd on a side thread.
+
+    The 50 Hz control loop only publishes a robot/VR snapshot. A stall inside
+    ``inverseKinematics`` (e.g. ik=130 ms wall) then hits this thread, not
+    ``loop=`` / legs / obs.
+    """
+
+    def __init__(self, writer: "Z1ArmWriter"):
+        self._writer = writer
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self._snap: Optional[dict] = None
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self.last_publish_ms = 0.0
+        self.last_send_ms = 0.0
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._loop, name="z1_arm_async", daemon=True
+        )
+        self._thread.start()
+        print(
+            "[arm] async IK/cmd thread started "
+            "(control loop publishes snapshots only).",
+            flush=True,
+        )
+
+    def stop(self) -> None:
+        self._stop.set()
+        with self._cv:
+            self._cv.notify_all()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    def publish(
+        self,
+        gripper_q,
+        robot: RobotState,
+        vr_goal,
+        phase_variable: float = 0.0,
+    ) -> None:
+        t0 = time.perf_counter()
+        snap = {
+            "gripper_q": gripper_q,
+            "robot": _copy_robot_for_arm(robot),
+            "vr_goal": vr_goal,
+            "phase_variable": float(phase_variable),
+        }
+        with self._cv:
+            self._snap = snap
+            self._cv.notify()
+        self.last_publish_ms = (time.perf_counter() - t0) * 1000.0
+
+    def _loop(self) -> None:
+        dt = float(self._writer.control_dt)
+        while not self._stop.is_set():
+            with self._cv:
+                while self._snap is None and not self._stop.is_set():
+                    self._cv.wait(timeout=dt)
+                if self._stop.is_set():
+                    break
+                snap = self._snap
+                self._snap = None
+            if snap is None:
+                continue
+            t0 = time.perf_counter()
+            try:
+                self._writer.send(
+                    gripper_q=snap["gripper_q"],
+                    robot=snap["robot"],
+                    vr_goal=snap["vr_goal"],
+                    obs_builder=None,
+                    phase_variable=snap["phase_variable"],
+                )
+            except Exception as exc:
+                print(f"[arm] async send failed: {exc}", flush=True)
+            self.last_send_ms = (time.perf_counter() - t0) * 1000.0
+            remain = dt - (time.perf_counter() - t0)
+            if remain > 0.0005:
+                self._stop.wait(remain)
+
+
 def leg_targets_from_action(
     action: np.ndarray,
     default_leg: np.ndarray,
@@ -784,9 +938,10 @@ def run_init_deploy_sequence(
     """Ramp to init_deploy_joint, hold while printing obs, then confirm policy.
 
     Returns True if user confirms policy motor output; False to keep holding init pose.
-    Obs + policy run in child processes (legs stay on ramp/hold until confirm).
+    Obs builds in a child (non-blocking take); policy stays in a child.
+    Legs stay on ramp/hold until confirm.
     """
-    del obs_builder  # history / build live in async_obs child
+    del obs_builder  # history / build live in the obs child
     ramp_s = float(config.get("init_deploy_ramp_s", 5.0))
     hold_s = float(config.get("init_deploy_hold_s", 5.0))
     use_cmd = bool(config["commands"].get("use_cmd"))
@@ -1185,6 +1340,7 @@ def main() -> None:
 
     lowcmd_writer = None
     z1_writer = None
+    arm_pump: Optional[AsyncZ1ArmPump] = None
     hotkeys = None
     # Dry run: evaluate policy (no lowcmd). execute: gated by init confirm.
     # arm-only: never send policy leg targets.
@@ -1221,6 +1377,9 @@ def main() -> None:
         flush=True,
     )
 
+    # Child process: a 50–120 ms stall inside ObservationBuilder must not
+    # freeze the 50 Hz loop (that showed up as obs=obs_build on the parent).
+    # Parent only try-locks SHM and keeps the last ready pack.
     async_obs = ProcessObsWorker(
         config,
         control_dt=dt,
@@ -1228,7 +1387,7 @@ def main() -> None:
         use_act=bool(args.act_ee),
     )
     async_obs.start()
-    print("[obs] process worker starting...", flush=True)
+    print("[obs] process worker starting (non-blocking take)...", flush=True)
     try:
         async_obs.wait_ready(timeout=60.0)
     except TimeoutError as exc:
@@ -1244,9 +1403,10 @@ def main() -> None:
         aggregator.close()
         return
     print(
-        "[obs] process worker ready (ObservationBuilder in child; own GIL).",
+        "[obs] process worker ready (own GIL; control loop never waits on build).",
         flush=True,
     )
+    _raise_control_priority()
 
     def _request_shutdown(signum, _frame) -> None:
         shutdown["stop"] = True
@@ -1514,6 +1674,10 @@ def main() -> None:
     }
     # Main loop publishes EE; stop the startup pump to avoid double-read.
     ee_pump_stop.set()
+    # Move IK/setArmCmd off the 50 Hz path (init ramp/hold still used sync send).
+    if z1_writer is not None:
+        arm_pump = AsyncZ1ArmPump(z1_writer)
+        arm_pump.start()
     try:
         while not shutdown["stop"]:
             t0 = time.perf_counter()
@@ -1528,17 +1692,16 @@ def main() -> None:
             leg_q_target = q_init
 
             if args.arm_only:
-                if z1_writer is not None:
-                    z1_writer.send(
+                if arm_pump is not None:
+                    arm_pump.publish(
                         gripper_q=robot.gripper_q,
                         robot=robot,
                         vr_goal=vr_goal,
-                        obs_builder=None,
                         phase_variable=0.0,
                     )
                 t_arm = time.perf_counter()
 
-                # Arm-only: obs child at 25 Hz for load; arm never waits on build.
+                # Arm-only: non-blocking obs child at 25 Hz; arm never waits on build.
                 obs_ms = 0.0
                 if do_print or step % 2 == 0:
                     t_ob0 = time.perf_counter()
@@ -1593,9 +1756,7 @@ def main() -> None:
                 }
                 teleop_ms = stages_ms["read"] + stages_ms["arm"]
             else:
-                # Full control: command arm *before* obs IPC so a stuck
-                # Array lock / scheduler delay cannot stall VR Tdes / ACT IK.
-                # Legs still use this tick's obs+policy (after arm).
+                # Full control: arm first, then in-process obs + policy for legs.
                 if args.act_ee:
                     vr_goal.update(
                         robot.ee_pos, robot.ee_quat, robot.base_quat
@@ -1603,12 +1764,11 @@ def main() -> None:
                     async_obs.set_act_goal(vr_goal.latest_arm_goal())
 
                 t_arm0 = time.perf_counter()
-                if z1_writer is not None:
-                    z1_writer.send(
+                if arm_pump is not None:
+                    arm_pump.publish(
                         gripper_q=robot.gripper_q,
                         robot=robot,
                         vr_goal=vr_goal,
-                        obs_builder=None,
                         phase_variable=float(
                             _last_obs_pack.get("phase_variable", 0.0)
                         ),
@@ -1661,7 +1821,7 @@ def main() -> None:
                 stages_ms = {
                     "read": (t_read - t0) * 1000.0,
                     "arm": (t_arm - t_arm0) * 1000.0,
-                    # Parent IPC submit/take only (child build overlapped).
+                    # Parent try-lock submit/take only (build runs in the child).
                     "obs": (t_obs - t_ob0) * 1000.0,
                     "policy": (t_policy - t_obs) * 1000.0,
                     "infer": policy_stage_ms,
@@ -1675,6 +1835,14 @@ def main() -> None:
             if _tick_ms >= max_work_ms:
                 max_work_ms = _tick_ms
                 max_stages_ms = dict(stages_ms)
+                # Snapshot THIS tick's ik/cmd (not the later print tick).
+                if z1_writer is not None:
+                    max_stages_ms["arm_ik"] = float(
+                        z1_writer._last_status.get("arm_ik_ms") or 0.0
+                    )
+                    max_stages_ms["arm_cmd"] = float(
+                        z1_writer._last_status.get("arm_cmd_ms") or 0.0
+                    )
             if z1_writer is not None:
                 # Arm-critical path for status; full tick still in work_ms stages.
                 z1_writer._last_status["loop_ms"] = teleop_ms
@@ -1716,14 +1884,15 @@ def main() -> None:
                         _resource.RUSAGE_SELF
                     ).ru_maxrss / 1024.0
                     if z1_writer is not None:
-                        ik_ms = float(z1_writer._last_status.get("arm_ik_ms") or 0.0)
-                        cmd_ms = float(z1_writer._last_status.get("arm_cmd_ms") or 0.0)
+                        ik_ms = float(max_stages_ms.get("arm_ik", 0.0))
+                        cmd_ms = float(max_stages_ms.get("arm_cmd", 0.0))
                         print(
                             f"  arm_lag_hint   : now={teleop_ms:.0f}ms "
                             f"max={max_work_ms:.0f}ms > dt={dt*1000.0:.0f}ms "
                             f"(read={max_stages_ms.get('read', 0):.1f} "
                             f"arm={max_stages_ms.get('arm', 0):.1f} "
-                            f"ik={ik_ms:.1f} cmd={cmd_ms:.1f} | "
+                            f"ik={ik_ms:.1f} cmd={cmd_ms:.1f} "
+                            f"(async arm worker) | "
                             f"obs_ipc={max_stages_ms.get('obs', 0):.1f} "
                             f"obs_build={max_stages_ms.get('obs_build', 0):.1f} "
                             f"pol_ipc={max_stages_ms.get('policy', 0):.1f} "
@@ -1784,6 +1953,8 @@ def main() -> None:
         print("\nStopped.")
     finally:
         _gc.enable()
+        if arm_pump is not None:
+            arm_pump.stop()
         if async_obs is not None:
             async_obs.stop()
         if async_policy is not None:

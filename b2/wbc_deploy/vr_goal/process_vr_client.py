@@ -94,6 +94,21 @@ def _unpack_pose(src: np.ndarray) -> dict:
     }
 
 
+def _empty_pose() -> dict:
+    """Safe hold-last fallback when SHM lock is busy and no cache yet."""
+    return {
+        "connected": False,
+        "holding": False,
+        "robot_ready": False,
+        "timestamp": None,
+        "position": None,
+        "orientation": None,
+        "Tdes": None,
+        "T_init": None,
+        "q_init": None,
+    }
+
+
 def _vr_process_entry(
     host: str,
     port: int,
@@ -209,13 +224,30 @@ class ProcessVrWorker:
         self._started = False
 
     def get_latest_pose(self) -> dict:
-        """Cheap shared-memory read — no JSON on the control process."""
-        with self._seq.get_lock():
+        """Cheap shared-memory read — no JSON on the control process.
+
+        Non-blocking: if a lock is busy, return the last cached pose (or an
+        empty disconnected pose) so the 50 Hz arm path never waits on the VR child.
+        """
+        seq_lock = self._seq.get_lock()
+        if not seq_lock.acquire(False):
+            return self._pose_cache if self._pose_cache is not None else _empty_pose()
+        try:
             cur = int(self._seq.value)
+        finally:
+            seq_lock.release()
+
         if self._pose_cache is not None and cur == self._last_seq:
             return self._pose_cache
-        with self._pose.get_lock():
+
+        pose_lock = self._pose.get_lock()
+        if not pose_lock.acquire(False):
+            return self._pose_cache if self._pose_cache is not None else _empty_pose()
+        try:
             buf = np.frombuffer(self._pose.get_obj(), dtype=np.float64).copy()
+        finally:
+            pose_lock.release()
+
         pose = _unpack_pose(buf)
         self._pose_cache = pose
         self._last_seq = cur
